@@ -908,24 +908,179 @@ bot.hears(/📦 Товары/i, async (ctx) => {
             return ctx.reply('❌ Не удалось получить данные');
         }
         
-        if (data.products.length === 0) {
-            return ctx.reply('📦 Список товаров пуст');
-        }
-        
         let msg = `📦 *ТОВАРЫ*\n${'═'.repeat(25)}\n\n`;
         
-        data.products.forEach((product, i) => {
-            msg += `${i + 1}. ${product}\n`;
-        });
+        if (data.products.length === 0) {
+            msg += `_Список пуст_\n`;
+        } else {
+            data.products.forEach((product, i) => {
+                msg += `${i + 1}. ${product}\n`;
+            });
+        }
         
         msg += `\n${'═'.repeat(25)}\n`;
         msg += `📊 Всего: *${data.products.length}* товаров`;
         
-        ctx.reply(msg, { parse_mode: 'Markdown' });
+        // Кнопка добавления
+        const addButton = Markup.inlineKeyboard([
+            [Markup.button.callback('➕ Добавить товар', 'add_product')]
+        ]);
+        
+        ctx.reply(msg, { parse_mode: 'Markdown', ...addButton });
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
     }
+});
+
+// Добавление товара - начало
+bot.action('add_product', async (ctx) => {
+    const userId = ctx.from.id;
+    if (!isAdmin(userId)) return ctx.answerCbQuery('⛔ Доступ запрещён!');
+    
+    await ctx.answerCbQuery();
+    sessions[userId].waitingForNewProduct = true;
+    saveSessions();
+    
+    ctx.reply('📦 Введите название нового товара:', Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Отмена', 'cancel_add')]
+    ]));
+});
+
+// Добавление товара - обработка ввода
+bot.on('text', async (ctx, next) => {
+    const userId = ctx.from.id;
+    const session = getSession(userId);
+    const text = ctx.message.text.trim();
+    
+    // Добавление товара
+    if (session.waitingForNewProduct) {
+        sessions[userId].waitingForNewProduct = false;
+        saveSessions();
+        
+        if (text.startsWith('/') || text.startsWith('🔙')) {
+            return ctx.reply('❌ Отменено', managementKeyboard);
+        }
+        
+        try {
+            const data = await getData();
+            if (!data) return ctx.reply('❌ Ошибка подключения к базе', managementKeyboard);
+            
+            // Проверяем, существует ли уже
+            if (data.products && data.products.includes(text)) {
+                return ctx.reply(`❌ Товар "${text}" уже существует!`, managementKeyboard);
+            }
+            
+            // Добавляем
+            if (!data.products) data.products = [];
+            data.products.push(text);
+            data.products.sort();
+            
+            // Сохраняем в Firebase
+            if (firebaseDb) {
+                await firebaseDb.ref('retailAppData/products').set(data.products);
+            }
+            
+            ctx.reply(`✅ Товар "*${text}*" добавлен!`, { parse_mode: 'Markdown', ...managementKeyboard });
+        } catch (e) {
+            console.error('Ошибка:', e);
+            ctx.reply('❌ Ошибка сохранения', managementKeyboard);
+        }
+        return;
+    }
+    
+    // Добавление фирмы
+    if (session.waitingForNewCompany) {
+        sessions[userId].waitingForNewCompany = false;
+        saveSessions();
+        
+        if (text.startsWith('/') || text.startsWith('🔙')) {
+            return ctx.reply('❌ Отменено', managementKeyboard);
+        }
+        
+        try {
+            const data = await getData();
+            if (!data) return ctx.reply('❌ Ошибка подключения к базе', managementKeyboard);
+            
+            if (data.companies && data.companies.includes(text)) {
+                return ctx.reply(`❌ Фирма "${text}" уже существует!`, managementKeyboard);
+            }
+            
+            if (!data.companies) data.companies = [];
+            data.companies.push(text);
+            data.companies.sort();
+            
+            if (firebaseDb) {
+                await firebaseDb.ref('retailAppData/companies').set(data.companies);
+            }
+            
+            ctx.reply(`✅ Фирма "*${text}*" добавлена!`, { parse_mode: 'Markdown', ...managementKeyboard });
+        } catch (e) {
+            console.error('Ошибка:', e);
+            ctx.reply('❌ Ошибка сохранения', managementKeyboard);
+        }
+        return;
+    }
+    
+    // Добавление клиента
+    if (session.waitingForNewClient) {
+        sessions[userId].waitingForNewClient = false;
+        saveSessions();
+        
+        if (text.startsWith('/') || text.startsWith('🔙')) {
+            return ctx.reply('❌ Отменено', managementKeyboard);
+        }
+        
+        try {
+            const data = await getData();
+            if (!data) return ctx.reply('❌ Ошибка подключения к базе', managementKeyboard);
+            
+            // Получаем текущих клиентов
+            let clients = [];
+            if (Array.isArray(data.clients)) {
+                clients = data.clients.map(c => typeof c === 'string' ? c : (c.name || ''));
+            }
+            
+            if (clients.includes(text)) {
+                return ctx.reply(`❌ Клиент "${text}" уже существует!`, managementKeyboard);
+            }
+            
+            // Добавляем как объект с именем
+            if (!data.clients) data.clients = [];
+            data.clients.push({ name: text });
+            
+            // Сортируем
+            data.clients.sort((a, b) => {
+                const nameA = typeof a === 'string' ? a : (a.name || '');
+                const nameB = typeof b === 'string' ? b : (b.name || '');
+                return nameA.localeCompare(nameB);
+            });
+            
+            if (firebaseDb) {
+                await firebaseDb.ref('retailAppData/clients').set(data.clients);
+            }
+            
+            ctx.reply(`✅ Клиент "*${text}*" добавлен!`, { parse_mode: 'Markdown', ...managementKeyboard });
+        } catch (e) {
+            console.error('Ошибка:', e);
+            ctx.reply('❌ Ошибка сохранения', managementKeyboard);
+        }
+        return;
+    }
+    
+    return next();
+});
+
+// Отмена добавления
+bot.action('cancel_add', async (ctx) => {
+    const userId = ctx.from.id;
+    sessions[userId].waitingForNewProduct = false;
+    sessions[userId].waitingForNewCompany = false;
+    sessions[userId].waitingForNewClient = false;
+    saveSessions();
+    
+    await ctx.answerCbQuery('Отменено');
+    ctx.reply('❌ Отменено', managementKeyboard);
 });
 
 // Список фирм
@@ -944,24 +1099,43 @@ bot.hears(/🏢 Фирмы/i, async (ctx) => {
             return ctx.reply('❌ Не удалось получить данные');
         }
         
-        if (data.companies.length === 0) {
-            return ctx.reply('🏢 Список фирм пуст');
-        }
-        
         let msg = `🏢 *ФИРМЫ*\n${'═'.repeat(25)}\n\n`;
         
-        data.companies.forEach((company, i) => {
-            msg += `${i + 1}. ${company}\n`;
-        });
+        if (data.companies.length === 0) {
+            msg += `_Список пуст_\n`;
+        } else {
+            data.companies.forEach((company, i) => {
+                msg += `${i + 1}. ${company}\n`;
+            });
+        }
         
         msg += `\n${'═'.repeat(25)}\n`;
         msg += `📊 Всего: *${data.companies.length}* фирм`;
         
-        ctx.reply(msg, { parse_mode: 'Markdown' });
+        // Кнопка добавления
+        const addButton = Markup.inlineKeyboard([
+            [Markup.button.callback('➕ Добавить фирму', 'add_company')]
+        ]);
+        
+        ctx.reply(msg, { parse_mode: 'Markdown', ...addButton });
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
     }
+});
+
+// Добавление фирмы - начало
+bot.action('add_company', async (ctx) => {
+    const userId = ctx.from.id;
+    if (!isAdmin(userId)) return ctx.answerCbQuery('⛔ Доступ запрещён!');
+    
+    await ctx.answerCbQuery();
+    sessions[userId].waitingForNewCompany = true;
+    saveSessions();
+    
+    ctx.reply('🏢 Введите название новой фирмы:', Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Отмена', 'cancel_add')]
+    ]));
 });
 
 // Список складов
@@ -1028,37 +1202,80 @@ bot.hears(/👤 Клиенты/i, async (ctx) => {
             return ctx.reply('❌ Не удалось получить данные');
         }
         
-        if (data.clients.length === 0) {
-            return ctx.reply('👤 Список клиентов пуст');
+        // Получаем имена клиентов (могут быть объекты или строки)
+        let clientNames = [];
+        if (Array.isArray(data.clients)) {
+            data.clients.forEach(c => {
+                if (typeof c === 'string') {
+                    clientNames.push(c);
+                } else if (c && c.name) {
+                    clientNames.push(c.name);
+                }
+            });
+        } else if (typeof data.clients === 'object') {
+            Object.values(data.clients).forEach(c => {
+                if (typeof c === 'string') {
+                    clientNames.push(c);
+                } else if (c && c.name) {
+                    clientNames.push(c.name);
+                }
+            });
         }
+        
+        // Сортируем
+        clientNames.sort();
         
         let msg = `👤 *КЛИЕНТЫ*\n${'═'.repeat(25)}\n\n`;
         
-        // Показываем первые 50 клиентов
-        const showClients = data.clients.slice(0, 50);
-        showClients.forEach((client, i) => {
-            msg += `${i + 1}. ${client}\n`;
-        });
-        
-        if (data.clients.length > 50) {
-            msg += `\n_...и ещё ${data.clients.length - 50} клиентов_\n`;
+        if (clientNames.length === 0) {
+            msg += `_Список пуст_\n`;
+        } else {
+            // Показываем первые 50 клиентов
+            const showClients = clientNames.slice(0, 50);
+            showClients.forEach((client, i) => {
+                msg += `${i + 1}. ${client}\n`;
+            });
+            
+            if (clientNames.length > 50) {
+                msg += `\n_...и ещё ${clientNames.length - 50} клиентов_\n`;
+            }
         }
         
         msg += `\n${'═'.repeat(25)}\n`;
-        msg += `📊 Всего: *${data.clients.length}* клиентов`;
+        msg += `📊 Всего: *${clientNames.length}* клиентов`;
+        
+        // Кнопка добавления
+        const addButton = Markup.inlineKeyboard([
+            [Markup.button.callback('➕ Добавить клиента', 'add_client')]
+        ]);
         
         if (msg.length > 4000) {
             const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (const part of parts) {
-                await ctx.reply(part, { parse_mode: 'Markdown' });
+            for (let i = 0; i < parts.length - 1; i++) {
+                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
             }
+            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...addButton });
         } else {
-            ctx.reply(msg, { parse_mode: 'Markdown' });
+            ctx.reply(msg, { parse_mode: 'Markdown', ...addButton });
         }
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
     }
+});
+
+// Добавление клиента - начало
+bot.action('add_client', async (ctx) => {
+    const userId = ctx.from.id;
+    if (!isAdmin(userId)) return ctx.answerCbQuery('⛔ Доступ запрещён!');
+    
+    await ctx.answerCbQuery();
+    sessions[userId].waitingForNewClient = true;
+    saveSessions();
+    
+    ctx.reply('👤 Введите имя нового клиента:', Markup.inlineKeyboard([
+        [Markup.button.callback('❌ Отмена', 'cancel_add')]
+    ]));
 });
 
 // Список годов
