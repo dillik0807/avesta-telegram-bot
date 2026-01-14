@@ -450,8 +450,7 @@ const adminKeyboard = Markup.keyboard([
 const reportsKeyboard = Markup.keyboard([
     ['📈 Приход за период', '📉 Расход за период'],
     ['💵 Погашения за период', '👥 Топ должников'],
-    ['🚂 Итоги вагонов', '🛒 Расход по клиентам'],
-    ['� Приход товаров', '�👤 Карточка клиента'],
+    ['🚂 Итоги вагонов', ' Карточка клиента'],
     ['🔙 Назад']
 ]).resize();
 const managementKeyboard = Markup.keyboard([
