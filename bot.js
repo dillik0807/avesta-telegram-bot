@@ -83,11 +83,80 @@ const hashPassword = (password) => {
 const isAuthorized = (userId) => sessions[userId] && sessions[userId].authorized;
 const getSession = (userId) => sessions[userId] || {};
 const getUserYear = (userId) => getSession(userId).year || DEFAULT_YEAR;
+const getUserWarehouseGroups = (userId) => getSession(userId).warehouseGroup || [];
 const setUserYear = (userId, year) => {
     if (sessions[userId]) {
         sessions[userId].year = year;
         saveSessions();
     }
+};
+
+// Проверка доступа к складу по группе
+const canAccessWarehouse = (userId, warehouseName, warehouseGroups) => {
+    const session = getSession(userId);
+    // Админ видит всё
+    if (session.role === 'admin') return true;
+    // Если у пользователя нет ограничений по группам - видит всё
+    const userGroups = session.warehouseGroup || [];
+    if (!userGroups || userGroups.length === 0 || !userGroups[0]) return true;
+    // Проверяем группу склада
+    const whGroup = warehouseGroups[warehouseName];
+    if (!whGroup) return true; // Если у склада нет группы - показываем
+    return userGroups.includes(whGroup);
+};
+
+// Фильтрация данных по группам складов пользователя
+const filterDataByWarehouseGroup = (data, userId) => {
+    const session = getSession(userId);
+    // Админ видит всё
+    if (session.role === 'admin') return data;
+    // Если у пользователя нет ограничений по группам - видит всё
+    const userGroups = session.warehouseGroup || [];
+    if (!userGroups || userGroups.length === 0 || !userGroups[0]) return data;
+    
+    // Получаем маппинг склад -> группа
+    const warehouseToGroup = {};
+    (data.warehouses || []).forEach(w => {
+        if (w.name && w.group) {
+            warehouseToGroup[w.name] = w.group;
+        }
+    });
+    
+    // Функция проверки доступа к складу
+    const hasAccess = (warehouseName) => {
+        const whGroup = warehouseToGroup[warehouseName];
+        if (!whGroup) return true; // Если у склада нет группы - показываем
+        return userGroups.includes(whGroup);
+    };
+    
+    // Фильтруем данные года
+    const filteredData = JSON.parse(JSON.stringify(data)); // Глубокая копия
+    
+    if (filteredData.years) {
+        Object.keys(filteredData.years).forEach(year => {
+            const yearData = filteredData.years[year];
+            
+            // Фильтруем приход
+            if (yearData.income) {
+                yearData.income = yearData.income.filter(item => hasAccess(item.warehouse));
+            }
+            
+            // Фильтруем расход
+            if (yearData.expense) {
+                yearData.expense = yearData.expense.filter(item => hasAccess(item.warehouse));
+            }
+        });
+    }
+    
+    // Фильтруем список складов
+    if (filteredData.warehouses) {
+        filteredData.warehouses = filteredData.warehouses.filter(w => {
+            if (!w.group) return true;
+            return userGroups.includes(w.group);
+        });
+    }
+    
+    return filteredData;
 };
 
 // Получение данных из Firebase
@@ -651,7 +720,13 @@ bot.on('text', async (ctx, next) => {
                 return ctx.reply('❌ Неверный пароль!', loginKeyboard);
             }
             
-            sessions[userId] = { authorized: true, username: user.username, role: user.role, year: DEFAULT_YEAR };
+            sessions[userId] = { 
+                authorized: true, 
+                username: user.username, 
+                role: user.role, 
+                year: DEFAULT_YEAR,
+                warehouseGroup: user.warehouseGroup || []
+            };
             saveSessions();
             
             ctx.reply(
@@ -1286,8 +1361,11 @@ bot.hears(/📈|приход за период/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка...');
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         const yearData = data?.years?.[year];
         if (!yearData || !yearData.income || yearData.income.length === 0) {
@@ -1358,8 +1436,11 @@ bot.action(/^incdet_(today|yesterday|week|month|year)$/, async (ctx) => {
     await ctx.answerCbQuery('⏳ Загрузка...');
     
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         const yearData = data?.years?.[year];
         if (!yearData || !yearData.income || yearData.income.length === 0) {
@@ -1598,8 +1679,11 @@ bot.hears(/📉|расход за период/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка...');
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         const yearData = data?.years?.[year];
         if (!yearData || !yearData.expense || yearData.expense.length === 0) {
@@ -1684,8 +1768,11 @@ bot.action(/^expdet_(today|yesterday|week|month|year)$/, async (ctx) => {
     await ctx.answerCbQuery('⏳ Загрузка...');
     
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         const yearData = data?.years?.[year];
         if (!yearData || !yearData.expense || yearData.expense.length === 0) {
@@ -3165,8 +3252,11 @@ bot.hears(/📦|\/stock|остатки складов/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка...');
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные из базы');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные из базы');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         const balances = calculateStock(data, year);
         if (!balances || !Object.keys(balances).length) return ctx.reply(`📦 Нет данных об остатках за ${year} год`);
@@ -3205,8 +3295,11 @@ bot.hears(/🏭|фактический остаток/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка фактических остатков...');
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные из базы');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные из базы');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         const factBalance = calculateFactBalance(data, year);
         
@@ -3457,8 +3550,11 @@ bot.hears(/📊|\/summary|сводка/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка...');
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные из базы');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные из базы');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         const yearData = data?.years?.[year];
         if (!yearData) return ctx.reply(`📊 Нет данных за ${year} год`);
@@ -3525,8 +3621,11 @@ bot.action(/^daily_(today|yesterday|2days)$/, async (ctx) => {
     await ctx.answerCbQuery('⏳ Загрузка...');
     
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         // Определяем дату
         const today = new Date();
