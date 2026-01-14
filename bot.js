@@ -3295,11 +3295,8 @@ bot.hears(/🏭|фактический остаток/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка фактических остатков...');
     try {
-        const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные из базы');
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные из базы');
         
         const factBalance = calculateFactBalance(data, year);
         
