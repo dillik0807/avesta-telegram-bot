@@ -1319,10 +1319,276 @@ bot.hears(/📈|приход за период/i, async (ctx) => {
         msg += `📊 Всего: *${totalCount}* записей\n`;
         msg += `📦 Итого: *${formatNumber(totalTons)} тонн*`;
         
-        ctx.reply(msg, { parse_mode: 'Markdown' });
+        // Кнопка для детального отчёта
+        const detailButton = Markup.inlineKeyboard([
+            [Markup.button.callback('📋 Детальный за период', 'income_detail_menu')]
+        ]);
+        
+        ctx.reply(msg, { parse_mode: 'Markdown', ...detailButton });
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Меню выбора периода для детального прихода
+bot.action('income_detail_menu', async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    
+    await ctx.answerCbQuery();
+    
+    const periodButtons = Markup.inlineKeyboard([
+        [Markup.button.callback('📅 Сегодня', 'incdet_today'), Markup.button.callback('📅 Вчера', 'incdet_yesterday')],
+        [Markup.button.callback('📅 Эта неделя', 'incdet_week'), Markup.button.callback('📅 Этот месяц', 'incdet_month')],
+        [Markup.button.callback('📅 Весь год', 'incdet_year')]
+    ]);
+    
+    ctx.reply(
+        `📋 *ДЕТАЛЬНЫЙ ПРИХОД*\n📅 Год: *${year}*\n\nВыберите период:`,
+        { parse_mode: 'Markdown', ...periodButtons }
+    );
+});
+
+// Обработка выбора периода для детального прихода
+bot.action(/^incdet_(today|yesterday|week|month|year)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    const periodType = ctx.match[1];
+    
+    await ctx.answerCbQuery('⏳ Загрузка...');
+    
+    try {
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        
+        const yearData = data?.years?.[year];
+        if (!yearData || !yearData.income || yearData.income.length === 0) {
+            return ctx.reply(`📈 Нет данных о приходе за ${year} год`);
+        }
+        
+        // Определяем период
+        const today = new Date();
+        let dateFrom, dateTo, periodName;
+        
+        switch (periodType) {
+            case 'today':
+                dateFrom = new Date(today.toISOString().split('T')[0]);
+                dateTo = new Date(today.toISOString().split('T')[0]);
+                dateTo.setHours(23, 59, 59);
+                periodName = 'Сегодня';
+                break;
+            case 'yesterday':
+                const yesterday = new Date(today);
+                yesterday.setDate(yesterday.getDate() - 1);
+                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
+                dateTo = new Date(yesterday.toISOString().split('T')[0]);
+                dateTo.setHours(23, 59, 59);
+                periodName = 'Вчера';
+                break;
+            case 'week':
+                dateFrom = new Date(today);
+                dateFrom.setDate(dateFrom.getDate() - 7);
+                dateTo = today;
+                periodName = 'За неделю';
+                break;
+            case 'month':
+                dateFrom = new Date(today);
+                dateFrom.setMonth(dateFrom.getMonth() - 1);
+                dateTo = today;
+                periodName = 'За месяц';
+                break;
+            case 'year':
+                dateFrom = null;
+                dateTo = null;
+                periodName = `За ${year} год`;
+                break;
+        }
+        
+        // Фильтруем данные
+        let income = yearData.income;
+        if (dateFrom && dateTo) {
+            income = income.filter(item => {
+                const itemDate = new Date(item.date);
+                return itemDate >= dateFrom && itemDate <= dateTo;
+            });
+        }
+        
+        if (income.length === 0) {
+            return ctx.reply(`📈 Нет данных о приходе за выбранный период`);
+        }
+        
+        // Формируем данные для отчёта
+        const items = income.map(item => ({
+            date: item.date || '',
+            wagon: item.wagon || '',
+            company: item.company || '',
+            warehouse: item.warehouse || '',
+            product: item.product || '',
+            qtyDoc: parseFloat(item.qtyDoc) || 0,
+            qtyFact: parseFloat(item.qtyFact) || 0,
+            difference: (parseFloat(item.qtyFact) || 0) - (parseFloat(item.qtyDoc) || 0),
+            weightTons: (parseFloat(item.qtyFact) || 0) / 20,
+            notes: item.notes || ''
+        }));
+        
+        // Сортируем по дате (новые сверху)
+        items.sort((a, b) => new Date(b.date) - new Date(a.date));
+        
+        // Итоги
+        let totalDoc = 0, totalFact = 0, totalTons = 0;
+        items.forEach(item => {
+            totalDoc += item.qtyDoc;
+            totalFact += item.qtyFact;
+            totalTons += item.weightTons;
+        });
+        
+        let msg = `📋 *ДЕТАЛЬНЫЙ ПРИХОД*\n`;
+        msg += `📅 ${periodName}\n`;
+        msg += `${'═'.repeat(25)}\n\n`;
+        
+        // Показываем до 15 записей
+        const showItems = items.slice(0, 15);
+        showItems.forEach((item, i) => {
+            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
+            msg += `${i + 1}. *${formattedDate}*\n`;
+            msg += `   🚂 ${item.wagon} | ${item.product}\n`;
+            msg += `   ${item.company} → ${item.warehouse}\n`;
+            msg += `   📄 ${item.qtyDoc} | ✅ ${item.qtyFact} | ⚖️ ${formatNumber(item.weightTons)} т\n\n`;
+        });
+        
+        if (items.length > 15) {
+            msg += `_...и ещё ${items.length - 15} записей_\n\n`;
+        }
+        
+        msg += `${'═'.repeat(25)}\n`;
+        msg += `📊 *ИТОГО:* ${items.length} записей\n`;
+        msg += `   📄 По док: *${totalDoc}* шт\n`;
+        msg += `   ✅ Факт: *${totalFact}* шт\n`;
+        msg += `   📈 Разница: *${totalFact - totalDoc}* шт\n`;
+        msg += `   ⚖️ Вес: *${formatNumber(totalTons)} тонн*`;
+        
+        // Сохраняем данные для экспорта
+        sessions[userId].lastIncomeDetail = { items, periodName, year, totals: { doc: totalDoc, fact: totalFact, tons: totalTons } };
+        saveSessions();
+        
+        // Кнопка экспорта
+        const exportButton = Markup.inlineKeyboard([
+            [Markup.button.callback('📊 Экспорт в Excel', `exincdet_${periodType}`)]
+        ]);
+        
+        if (msg.length > 4000) {
+            const parts = msg.match(/[\s\S]{1,4000}/g);
+            for (let i = 0; i < parts.length - 1; i++) {
+                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
+            }
+            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
+        } else {
+            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
+        }
+        
+    } catch (e) {
+        console.error('Ошибка:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Экспорт детального прихода в Excel
+bot.action(/^exincdet_(.+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const session = getSession(userId);
+    
+    if (!session.lastIncomeDetail) {
+        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
+    }
+    
+    await ctx.answerCbQuery('📊 Создание Excel файла...');
+    
+    const { items, periodName, year, totals } = session.lastIncomeDetail;
+    
+    try {
+        const workbook = new ExcelJS.Workbook();
+        const sheet = workbook.addWorksheet('Детальный приход');
+        
+        // Заголовки
+        sheet.columns = [
+            { header: '№', key: 'num', width: 5 },
+            { header: 'Дата', key: 'date', width: 12 },
+            { header: 'Вагон', key: 'wagon', width: 15 },
+            { header: 'Фирма', key: 'company', width: 18 },
+            { header: 'Склад', key: 'warehouse', width: 15 },
+            { header: 'Товар', key: 'product', width: 18 },
+            { header: 'По док', key: 'qtyDoc', width: 10 },
+            { header: 'Факт', key: 'qtyFact', width: 10 },
+            { header: 'Разница', key: 'difference', width: 10 },
+            { header: 'Вес (т)', key: 'weightTons', width: 10 },
+            { header: 'Примечания', key: 'notes', width: 25 }
+        ];
+        
+        // Стиль заголовков
+        sheet.getRow(1).font = { bold: true };
+        sheet.getRow(1).fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF4CAF50' }
+        };
+        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        
+        // Данные
+        items.forEach((item, i) => {
+            sheet.addRow({
+                num: i + 1,
+                date: item.date,
+                wagon: item.wagon,
+                company: item.company,
+                warehouse: item.warehouse,
+                product: item.product,
+                qtyDoc: item.qtyDoc,
+                qtyFact: item.qtyFact,
+                difference: item.difference,
+                weightTons: item.weightTons,
+                notes: item.notes
+            });
+        });
+        
+        // Итоговая строка
+        const totalRow = sheet.addRow({
+            num: '',
+            date: '',
+            wagon: '',
+            company: '',
+            warehouse: '',
+            product: 'ИТОГО:',
+            qtyDoc: totals.doc,
+            qtyFact: totals.fact,
+            difference: totals.fact - totals.doc,
+            weightTons: totals.tons,
+            notes: ''
+        });
+        totalRow.font = { bold: true };
+        totalRow.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFEEEEEE' }
+        };
+        
+        // Сохраняем файл
+        const fileName = `Приход_детальный_${periodName.replace(/\s/g, '_')}_${year}.xlsx`;
+        const filePath = path.join(__dirname, fileName);
+        await workbook.xlsx.writeFile(filePath);
+        
+        // Отправляем файл
+        await ctx.replyWithDocument(
+            { source: filePath, filename: fileName },
+            { caption: `📋 Детальный приход\n📅 ${periodName}\n📊 ${items.length} записей\n⚖️ ${formatNumber(totals.tons)} тонн` }
+        );
+        
+        // Удаляем временный файл
+        fs.unlinkSync(filePath);
+        
+    } catch (e) {
+        console.error('Ошибка экспорта:', e);
+        ctx.reply('❌ Ошибка создания Excel файла');
     }
 });
 
@@ -1371,14 +1637,284 @@ bot.hears(/📉|расход за период/i, async (ctx) => {
         msg += `📦 Итого: *${formatNumber(totalTons)} тонн*\n`;
         msg += `💰 Сумма: *${formatNumber(totalSum)} $*`;
         
+        // Кнопка для детального отчёта
+        const detailButton = Markup.inlineKeyboard([
+            [Markup.button.callback('📋 Детальный за период', 'expense_detail_menu')]
+        ]);
+        
         if (msg.length > 4000) {
-            for (const part of msg.match(/[\s\S]{1,4000}/g)) await ctx.reply(part, { parse_mode: 'Markdown' });
+            const parts = msg.match(/[\s\S]{1,4000}/g);
+            for (let i = 0; i < parts.length - 1; i++) {
+                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
+            }
+            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...detailButton });
         } else {
-            ctx.reply(msg, { parse_mode: 'Markdown' });
+            ctx.reply(msg, { parse_mode: 'Markdown', ...detailButton });
         }
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Меню выбора периода для детального расхода
+bot.action('expense_detail_menu', async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    
+    await ctx.answerCbQuery();
+    
+    const periodButtons = Markup.inlineKeyboard([
+        [Markup.button.callback('📅 Сегодня', 'expdet_today'), Markup.button.callback('📅 Вчера', 'expdet_yesterday')],
+        [Markup.button.callback('📅 Эта неделя', 'expdet_week'), Markup.button.callback('📅 Этот месяц', 'expdet_month')],
+        [Markup.button.callback('📅 Весь год', 'expdet_year')]
+    ]);
+    
+    ctx.reply(
+        `📋 *ДЕТАЛЬНЫЙ РАСХОД*\n📅 Год: *${year}*\n\nВыберите период:`,
+        { parse_mode: 'Markdown', ...periodButtons }
+    );
+});
+
+// Обработка выбора периода для детального расхода
+bot.action(/^expdet_(today|yesterday|week|month|year)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    const periodType = ctx.match[1];
+    
+    await ctx.answerCbQuery('⏳ Загрузка...');
+    
+    try {
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        
+        const yearData = data?.years?.[year];
+        if (!yearData || !yearData.expense || yearData.expense.length === 0) {
+            return ctx.reply(`📉 Нет данных о расходе за ${year} год`);
+        }
+        
+        // Определяем период
+        const today = new Date();
+        let dateFrom, dateTo, periodName;
+        
+        switch (periodType) {
+            case 'today':
+                dateFrom = new Date(today.toISOString().split('T')[0]);
+                dateTo = new Date(today.toISOString().split('T')[0]);
+                dateTo.setHours(23, 59, 59);
+                periodName = 'Сегодня';
+                break;
+            case 'yesterday':
+                const yesterday = new Date(today);
+                yesterday.setDate(yesterday.getDate() - 1);
+                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
+                dateTo = new Date(yesterday.toISOString().split('T')[0]);
+                dateTo.setHours(23, 59, 59);
+                periodName = 'Вчера';
+                break;
+            case 'week':
+                dateFrom = new Date(today);
+                dateFrom.setDate(dateFrom.getDate() - 7);
+                dateTo = today;
+                periodName = 'За неделю';
+                break;
+            case 'month':
+                dateFrom = new Date(today);
+                dateFrom.setMonth(dateFrom.getMonth() - 1);
+                dateTo = today;
+                periodName = 'За месяц';
+                break;
+            case 'year':
+                dateFrom = null;
+                dateTo = null;
+                periodName = `За ${year} год`;
+                break;
+        }
+        
+        // Фильтруем данные
+        let expense = yearData.expense;
+        if (dateFrom && dateTo) {
+            expense = expense.filter(item => {
+                const itemDate = new Date(item.date);
+                return itemDate >= dateFrom && itemDate <= dateTo;
+            });
+        }
+        
+        if (expense.length === 0) {
+            return ctx.reply(`📉 Нет данных о расходе за выбранный период`);
+        }
+        
+        // Формируем данные для отчёта
+        const items = expense.map(item => ({
+            date: item.date || '',
+            client: item.client || '',
+            product: item.product || '',
+            company: item.company || '',
+            warehouse: item.warehouse || '',
+            quantity: parseFloat(item.quantity) || 0,
+            tons: (parseFloat(item.quantity) || 0) / 20,
+            price: parseFloat(item.price) || 0,
+            total: parseFloat(item.total) || 0,
+            notes: item.notes || ''
+        }));
+        
+        // Сортируем по дате (новые сверху)
+        items.sort((a, b) => new Date(b.date) - new Date(a.date));
+        
+        // Итоги
+        let totalQty = 0, totalTons = 0, totalSum = 0;
+        items.forEach(item => {
+            totalQty += item.quantity;
+            totalTons += item.tons;
+            totalSum += item.total;
+        });
+        
+        let msg = `📋 *ДЕТАЛЬНЫЙ РАСХОД*\n`;
+        msg += `📅 ${periodName}\n`;
+        msg += `${'═'.repeat(25)}\n\n`;
+        
+        // Показываем до 15 записей
+        const showItems = items.slice(0, 15);
+        showItems.forEach((item, i) => {
+            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
+            msg += `${i + 1}. *${formattedDate}*\n`;
+            msg += `   👤 ${item.client}\n`;
+            msg += `   ${item.product} | ${item.warehouse}\n`;
+            msg += `   📦 ${item.quantity} шт | ⚖️ ${formatNumber(item.tons)} т\n`;
+            msg += `   💵 *${formatNumber(item.total)} $*\n\n`;
+        });
+        
+        if (items.length > 15) {
+            msg += `_...и ещё ${items.length - 15} записей_\n\n`;
+        }
+        
+        msg += `${'═'.repeat(25)}\n`;
+        msg += `📊 *ИТОГО:* ${items.length} записей\n`;
+        msg += `   📦 Количество: *${totalQty}* шт\n`;
+        msg += `   ⚖️ Вес: *${formatNumber(totalTons)} тонн*\n`;
+        msg += `   💰 Сумма: *${formatNumber(totalSum)} $*`;
+        
+        // Сохраняем данные для экспорта
+        sessions[userId].lastExpenseDetail = { items, periodName, year, totals: { qty: totalQty, tons: totalTons, sum: totalSum } };
+        saveSessions();
+        
+        // Кнопка экспорта
+        const exportButton = Markup.inlineKeyboard([
+            [Markup.button.callback('📊 Экспорт в Excel', `exexpdet_${periodType}`)]
+        ]);
+        
+        if (msg.length > 4000) {
+            const parts = msg.match(/[\s\S]{1,4000}/g);
+            for (let i = 0; i < parts.length - 1; i++) {
+                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
+            }
+            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
+        } else {
+            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
+        }
+        
+    } catch (e) {
+        console.error('Ошибка:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Экспорт детального расхода в Excel
+bot.action(/^exexpdet_(.+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const session = getSession(userId);
+    
+    if (!session.lastExpenseDetail) {
+        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
+    }
+    
+    await ctx.answerCbQuery('📊 Создание Excel файла...');
+    
+    const { items, periodName, year, totals } = session.lastExpenseDetail;
+    
+    try {
+        const workbook = new ExcelJS.Workbook();
+        const sheet = workbook.addWorksheet('Детальный расход');
+        
+        // Заголовки
+        sheet.columns = [
+            { header: '№', key: 'num', width: 5 },
+            { header: 'Дата', key: 'date', width: 12 },
+            { header: 'Клиент', key: 'client', width: 20 },
+            { header: 'Товар', key: 'product', width: 15 },
+            { header: 'Фирма', key: 'company', width: 15 },
+            { header: 'Склад', key: 'warehouse', width: 15 },
+            { header: 'Кол-во', key: 'quantity', width: 10 },
+            { header: 'Тонны', key: 'tons', width: 10 },
+            { header: 'Цена', key: 'price', width: 10 },
+            { header: 'Сумма', key: 'total', width: 12 },
+            { header: 'Примечания', key: 'notes', width: 20 }
+        ];
+        
+        // Стиль заголовков
+        sheet.getRow(1).font = { bold: true };
+        sheet.getRow(1).fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFFF5722' }
+        };
+        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        
+        // Данные
+        items.forEach((item, i) => {
+            sheet.addRow({
+                num: i + 1,
+                date: item.date,
+                client: item.client,
+                product: item.product,
+                company: item.company,
+                warehouse: item.warehouse,
+                quantity: item.quantity,
+                tons: item.tons,
+                price: item.price,
+                total: item.total,
+                notes: item.notes
+            });
+        });
+        
+        // Итоговая строка
+        const totalRow = sheet.addRow({
+            num: '',
+            date: '',
+            client: '',
+            product: '',
+            company: '',
+            warehouse: 'ИТОГО:',
+            quantity: totals.qty,
+            tons: totals.tons,
+            price: '',
+            total: totals.sum,
+            notes: ''
+        });
+        totalRow.font = { bold: true };
+        totalRow.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFEEEEEE' }
+        };
+        
+        // Сохраняем файл
+        const fileName = `Расход_детальный_${periodName.replace(/\s/g, '_')}_${year}.xlsx`;
+        const filePath = path.join(__dirname, fileName);
+        await workbook.xlsx.writeFile(filePath);
+        
+        // Отправляем файл
+        await ctx.replyWithDocument(
+            { source: filePath, filename: fileName },
+            { caption: `📋 Детальный расход\n📅 ${periodName}\n📊 ${items.length} записей\n💰 ${formatNumber(totals.sum)} $` }
+        );
+        
+        // Удаляем временный файл
+        fs.unlinkSync(filePath);
+        
+    } catch (e) {
+        console.error('Ошибка экспорта:', e);
+        ctx.reply('❌ Ошибка создания Excel файла');
     }
 });
 
@@ -1421,10 +1957,280 @@ bot.hears(/💵|погашения за период/i, async (ctx) => {
         msg += `📊 Всего: *${totalCount}* платежей\n`;
         msg += `💰 Итого: *${formatNumber(totalSum)} $*`;
         
-        ctx.reply(msg, { parse_mode: 'Markdown' });
+        // Кнопка для детального отчёта
+        const detailButton = Markup.inlineKeyboard([
+            [Markup.button.callback('📋 Детальный за период', 'payments_detail_menu')]
+        ]);
+        
+        ctx.reply(msg, { parse_mode: 'Markdown', ...detailButton });
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Меню выбора периода для детальных погашений
+bot.action('payments_detail_menu', async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    
+    await ctx.answerCbQuery();
+    
+    const periodButtons = Markup.inlineKeyboard([
+        [Markup.button.callback('📅 Сегодня', 'paydet_today'), Markup.button.callback('📅 Вчера', 'paydet_yesterday')],
+        [Markup.button.callback('📅 Эта неделя', 'paydet_week'), Markup.button.callback('📅 Этот месяц', 'paydet_month')],
+        [Markup.button.callback('📅 Весь год', 'paydet_year')]
+    ]);
+    
+    ctx.reply(
+        `📋 *ДЕТАЛЬНЫЕ ПОГАШЕНИЯ*\n📅 Год: *${year}*\n\nВыберите период:`,
+        { parse_mode: 'Markdown', ...periodButtons }
+    );
+});
+
+// Обработка выбора периода для детальных погашений
+bot.action(/^paydet_(today|yesterday|week|month|year)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    const periodType = ctx.match[1];
+    
+    await ctx.answerCbQuery('⏳ Загрузка...');
+    
+    try {
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        
+        const yearData = data?.years?.[year];
+        if (!yearData || !yearData.payments || yearData.payments.length === 0) {
+            return ctx.reply(`💵 Нет данных о погашениях за ${year} год`);
+        }
+        
+        // Определяем период
+        const today = new Date();
+        let dateFrom, dateTo, periodName;
+        
+        switch (periodType) {
+            case 'today':
+                dateFrom = new Date(today.toISOString().split('T')[0]);
+                dateTo = new Date(today.toISOString().split('T')[0]);
+                dateTo.setHours(23, 59, 59);
+                periodName = 'Сегодня';
+                break;
+            case 'yesterday':
+                const yesterday = new Date(today);
+                yesterday.setDate(yesterday.getDate() - 1);
+                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
+                dateTo = new Date(yesterday.toISOString().split('T')[0]);
+                dateTo.setHours(23, 59, 59);
+                periodName = 'Вчера';
+                break;
+            case 'week':
+                dateFrom = new Date(today);
+                dateFrom.setDate(dateFrom.getDate() - 7);
+                dateTo = today;
+                periodName = 'За неделю';
+                break;
+            case 'month':
+                dateFrom = new Date(today);
+                dateFrom.setMonth(dateFrom.getMonth() - 1);
+                dateTo = today;
+                periodName = 'За месяц';
+                break;
+            case 'year':
+                dateFrom = null;
+                dateTo = null;
+                periodName = `За ${year} год`;
+                break;
+        }
+        
+        // Фильтруем данные
+        let payments = yearData.payments;
+        if (dateFrom && dateTo) {
+            payments = payments.filter(item => {
+                const itemDate = new Date(item.date);
+                return itemDate >= dateFrom && itemDate <= dateTo;
+            });
+        }
+        
+        if (payments.length === 0) {
+            return ctx.reply(`💵 Нет погашений за выбранный период`);
+        }
+        
+        // Формируем данные для отчёта
+        const items = payments.map(item => ({
+            date: item.date || '',
+            client: item.client || '',
+            amount: parseFloat(item.amount) || 0,
+            notes: item.notes || item.note || '',
+            user: item.user || ''
+        }));
+        
+        // Сортируем по дате (новые сверху)
+        items.sort((a, b) => new Date(b.date) - new Date(a.date));
+        
+        // Итоги
+        let totalSum = 0;
+        items.forEach(item => {
+            totalSum += item.amount;
+        });
+        
+        // Группируем по клиентам для статистики
+        const byClient = {};
+        items.forEach(item => {
+            if (!byClient[item.client]) byClient[item.client] = 0;
+            byClient[item.client] += item.amount;
+        });
+        
+        let msg = `📋 *ДЕТАЛЬНЫЕ ПОГАШЕНИЯ*\n`;
+        msg += `📅 ${periodName}\n`;
+        msg += `${'═'.repeat(25)}\n\n`;
+        
+        // Показываем до 20 записей
+        const showItems = items.slice(0, 20);
+        showItems.forEach((item, i) => {
+            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
+            msg += `${i + 1}. *${formattedDate}*\n`;
+            msg += `   👤 ${item.client}\n`;
+            msg += `   💵 *${formatNumber(item.amount)} $*\n`;
+            if (item.notes) {
+                msg += `   📝 ${item.notes}\n`;
+            }
+            msg += `\n`;
+        });
+        
+        if (items.length > 20) {
+            msg += `_...и ещё ${items.length - 20} записей_\n\n`;
+        }
+        
+        // Топ клиентов по погашениям
+        const topClients = Object.entries(byClient)
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 5);
+        
+        if (topClients.length > 0) {
+            msg += `${'─'.repeat(20)}\n`;
+            msg += `👥 *Топ по погашениям:*\n`;
+            topClients.forEach(([client, sum], i) => {
+                msg += `   ${i + 1}. ${client}: *${formatNumber(sum)} $*\n`;
+            });
+            msg += `\n`;
+        }
+        
+        msg += `${'═'.repeat(25)}\n`;
+        msg += `📊 *ИТОГО:* ${items.length} платежей\n`;
+        msg += `💰 Сумма: *${formatNumber(totalSum)} $*`;
+        
+        // Сохраняем данные для экспорта
+        sessions[userId].lastPaymentsDetail = { items, periodName, year, totalSum };
+        saveSessions();
+        
+        // Кнопка экспорта
+        const exportButton = Markup.inlineKeyboard([
+            [Markup.button.callback('📊 Экспорт в Excel', `expaydet_${periodType}`)]
+        ]);
+        
+        if (msg.length > 4000) {
+            const parts = msg.match(/[\s\S]{1,4000}/g);
+            for (let i = 0; i < parts.length - 1; i++) {
+                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
+            }
+            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
+        } else {
+            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
+        }
+        
+    } catch (e) {
+        console.error('Ошибка:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Экспорт детальных погашений в Excel
+bot.action(/^expaydet_(.+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const session = getSession(userId);
+    
+    if (!session.lastPaymentsDetail) {
+        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
+    }
+    
+    await ctx.answerCbQuery('📊 Создание Excel файла...');
+    
+    const { items, periodName, year, totalSum } = session.lastPaymentsDetail;
+    
+    try {
+        const workbook = new ExcelJS.Workbook();
+        const sheet = workbook.addWorksheet('Детальные погашения');
+        
+        // Заголовки
+        sheet.columns = [
+            { header: '№', key: 'num', width: 5 },
+            { header: 'Дата', key: 'date', width: 12 },
+            { header: 'Клиент', key: 'client', width: 25 },
+            { header: 'Сумма ($)', key: 'amount', width: 15 },
+            { header: 'Примечания', key: 'notes', width: 30 },
+            { header: 'Пользователь', key: 'user', width: 15 }
+        ];
+        
+        // Стиль заголовков
+        sheet.getRow(1).font = { bold: true };
+        sheet.getRow(1).fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FF2196F3' }
+        };
+        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        
+        // Данные
+        let total = 0;
+        items.forEach((item, i) => {
+            sheet.addRow({
+                num: i + 1,
+                date: item.date,
+                client: item.client,
+                amount: item.amount,
+                notes: item.notes,
+                user: item.user
+            });
+            total += item.amount;
+        });
+        
+        // Итоговая строка
+        const totalRow = sheet.addRow({
+            num: '',
+            date: '',
+            client: 'ИТОГО:',
+            amount: total,
+            notes: '',
+            user: ''
+        });
+        totalRow.font = { bold: true };
+        totalRow.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFEEEEEE' }
+        };
+        
+        // Форматирование колонки суммы
+        sheet.getColumn('amount').numFmt = '#,##0.00';
+        
+        // Сохраняем файл
+        const fileName = `Погашения_детальный_${periodName.replace(/\s/g, '_')}_${year}.xlsx`;
+        const filePath = path.join(__dirname, fileName);
+        await workbook.xlsx.writeFile(filePath);
+        
+        // Отправляем файл
+        await ctx.replyWithDocument(
+            { source: filePath, filename: fileName },
+            { caption: `📋 Детальные погашения\n📅 ${periodName}\n📊 ${items.length} платежей\n💰 ${formatNumber(totalSum)} $` }
+        );
+        
+        // Удаляем временный файл
+        fs.unlinkSync(filePath);
+        
+    } catch (e) {
+        console.error('Ошибка экспорта:', e);
+        ctx.reply('❌ Ошибка создания Excel файла');
     }
 });
 
