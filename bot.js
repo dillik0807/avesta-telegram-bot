@@ -1382,267 +1382,49 @@ bot.hears(/📉|расход за период/i, async (ctx) => {
     }
 });
 
-// Погашения за период - выбор периода
+// Погашения за период
 bot.hears(/💵|погашения за период/i, async (ctx) => {
     const userId = ctx.from.id;
     const year = getUserYear(userId);
     
-    ctx.reply(
-        `💵 *ПОГАШЕНИЯ*\n📅 Год: *${year}*\n\nВыберите период:`,
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('📅 Сегодня', 'pay_today'), Markup.button.callback('📅 Вчера', 'pay_yesterday')],
-                [Markup.button.callback('📅 Неделя', 'pay_week'), Markup.button.callback('📅 Месяц', 'pay_month')],
-                [Markup.button.callback('📅 Весь год', 'pay_year')]
-            ])
-        }
-    );
-});
-
-// Обработка выбора периода для погашений
-bot.action(/^pay_(today|yesterday|week|month|year)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const periodType = ctx.match[1];
-    
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
+    await ctx.reply('⏳ Загрузка...');
     try {
         const data = await getData();
         if (!data) return ctx.reply('❌ Не удалось получить данные');
         
         const yearData = data?.years?.[year];
         if (!yearData || !yearData.payments || yearData.payments.length === 0) {
-            return ctx.reply(`💵 Нет данных о погашениях за ${year} год`);
+            return ctx.reply(`� Нет данных о погашениях за ${year} год`);
         }
         
-        // Определяем период
-        const today = new Date();
-        let dateFrom, dateTo, periodName;
+        // Группируем по месяцам
+        const byMonth = {};
+        yearData.payments.forEach(item => {
+            const date = new Date(item.date);
+            const month = date.toLocaleString('ru', { month: 'long' });
+            if (!byMonth[month]) byMonth[month] = { count: 0, sum: 0 };
+            byMonth[month].count++;
+            byMonth[month].sum += item.amount || 0;
+        });
         
-        switch (periodType) {
-            case 'today':
-                dateFrom = new Date(today.toISOString().split('T')[0]);
-                dateTo = new Date(today.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Сегодня';
-                break;
-            case 'yesterday':
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Вчера';
-                break;
-            case 'week':
-                dateFrom = new Date(today);
-                dateFrom.setDate(dateFrom.getDate() - 7);
-                dateTo = today;
-                periodName = 'За неделю';
-                break;
-            case 'month':
-                dateFrom = new Date(today);
-                dateFrom.setMonth(dateFrom.getMonth() - 1);
-                dateTo = today;
-                periodName = 'За месяц';
-                break;
-            case 'year':
-                dateFrom = null;
-                dateTo = null;
-                periodName = `За ${year} год`;
-                break;
-        }
-        
-        // Фильтруем данные
-        let payments = yearData.payments;
-        if (dateFrom && dateTo) {
-            payments = payments.filter(item => {
-                const itemDate = new Date(item.date);
-                return itemDate >= dateFrom && itemDate <= dateTo;
-            });
-        }
-        
-        if (payments.length === 0) {
-            return ctx.reply(`💵 Нет погашений за выбранный период`);
-        }
-        
-        // Формируем данные для отчёта
-        const items = payments.map(item => ({
-            date: item.date || '',
-            client: item.client || '',
-            amount: parseFloat(item.amount) || 0,
-            notes: item.notes || '',
-            user: item.user || ''
-        }));
-        
-        // Сортируем по дате (новые сверху)
-        items.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        // Итоги
+        let msg = `💵 *ПОГАШЕНИЯ ЗА ${year}*\n${'─'.repeat(20)}\n\n`;
         let totalSum = 0;
-        items.forEach(item => {
-            totalSum += item.amount;
+        let totalCount = 0;
+        
+        Object.entries(byMonth).forEach(([month, data]) => {
+            msg += `📅 *${month}*: ${data.count} платежей, ${formatNumber(data.sum)} $\n`;
+            totalSum += data.sum;
+            totalCount += data.count;
         });
         
-        // Группируем по клиентам для статистики
-        const byClient = {};
-        items.forEach(item => {
-            if (!byClient[item.client]) byClient[item.client] = 0;
-            byClient[item.client] += item.amount;
-        });
+        msg += `\n${'─'.repeat(20)}\n`;
+        msg += `📊 Всего: *${totalCount}* платежей\n`;
+        msg += `💰 Итого: *${formatNumber(totalSum)} $*`;
         
-        let msg = `💵 *ПОГАШЕНИЯ*\n`;
-        msg += `📅 ${periodName}\n`;
-        msg += `${'═'.repeat(25)}\n\n`;
-        
-        // Показываем до 20 записей
-        const showItems = items.slice(0, 20);
-        showItems.forEach((item, i) => {
-            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
-            msg += `${i + 1}. *${formattedDate}*\n`;
-            msg += `   👤 ${item.client}\n`;
-            msg += `   💵 *${formatNumber(item.amount)} $*\n`;
-            if (item.notes) {
-                msg += `   📝 ${item.notes}\n`;
-            }
-            msg += `\n`;
-        });
-        
-        if (items.length > 20) {
-            msg += `_...и ещё ${items.length - 20} записей_\n\n`;
-        }
-        
-        // Топ клиентов по погашениям
-        const topClients = Object.entries(byClient)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5);
-        
-        if (topClients.length > 0) {
-            msg += `${'─'.repeat(20)}\n`;
-            msg += `👥 *Топ по погашениям:*\n`;
-            topClients.forEach(([client, sum], i) => {
-                msg += `   ${i + 1}. ${client}: *${formatNumber(sum)} $*\n`;
-            });
-            msg += `\n`;
-        }
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 *ИТОГО:* ${items.length} платежей\n`;
-        msg += `💰 Сумма: *${formatNumber(totalSum)} $*`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastPaymentsReport = { items, periodName, year, totalSum };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `expay_${periodType}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
+        ctx.reply(msg, { parse_mode: 'Markdown' });
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт погашений в Excel
-bot.action(/^expay_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastPaymentsReport) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { items, periodName, year, totalSum } = session.lastPaymentsReport;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Погашения');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Клиент', key: 'client', width: 25 },
-            { header: 'Сумма ($)', key: 'amount', width: 15 },
-            { header: 'Примечания', key: 'notes', width: 30 },
-            { header: 'Пользователь', key: 'user', width: 15 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FF2196F3' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        
-        // Данные
-        let total = 0;
-        items.forEach((item, i) => {
-            sheet.addRow({
-                num: i + 1,
-                date: item.date,
-                client: item.client,
-                amount: item.amount,
-                notes: item.notes,
-                user: item.user
-            });
-            total += item.amount;
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            date: '',
-            client: 'ИТОГО:',
-            amount: total,
-            notes: '',
-            user: ''
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Форматирование колонки суммы
-        sheet.getColumn('amount').numFmt = '#,##0.00';
-        
-        // Сохраняем файл
-        const fileName = `payments_${year}_${Date.now()}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: `Погашения_${periodName}_${year}.xlsx` },
-            { caption: `💵 Погашения\n📅 ${periodName}\n📊 ${items.length} платежей\n💰 Сумма: ${formatNumber(totalSum)} $` }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
     }
 });
 
