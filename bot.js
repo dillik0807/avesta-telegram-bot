@@ -1279,31 +1279,12 @@ bot.action('price_history', async (ctx) => {
 
 // ==================== КОНЕЦ МЕНЮ УПРАВЛЕНИЯ ====================
 
-// Приход за период - выбор периода
+// Приход за период
 bot.hears(/📈|приход за период/i, async (ctx) => {
     const userId = ctx.from.id;
     const year = getUserYear(userId);
-    ctx.reply(
-        `📈 *ПРИХОД ТОВАРОВ*\n📅 Год: *${year}*\n\nВыберите период:`,
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('📅 Сегодня', 'inc_today'), Markup.button.callback('📅 Вчера', 'inc_yesterday')],
-                [Markup.button.callback('📅 Неделя', 'inc_week'), Markup.button.callback('📅 Месяц', 'inc_month')],
-                [Markup.button.callback('📅 Весь год', 'inc_year')]
-            ])
-        }
-    );
-});
-
-// Обработка выбора периода для прихода
-bot.action(/^inc_(today|yesterday|week|month|year)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const periodType = ctx.match[1];
     
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
+    await ctx.reply('⏳ Загрузка...');
     try {
         const data = await getData();
         if (!data) return ctx.reply('❌ Не удалось получить данные');
@@ -1313,232 +1294,34 @@ bot.action(/^inc_(today|yesterday|week|month|year)$/, async (ctx) => {
             return ctx.reply(`📈 Нет данных о приходе за ${year} год`);
         }
         
-        // Определяем период
-        const today = new Date();
-        let dateFrom, dateTo, periodName;
-        
-        switch (periodType) {
-            case 'today':
-                dateFrom = new Date(today.toISOString().split('T')[0]);
-                dateTo = new Date(today.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Сегодня';
-                break;
-            case 'yesterday':
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Вчера';
-                break;
-            case 'week':
-                dateFrom = new Date(today);
-                dateFrom.setDate(dateFrom.getDate() - 7);
-                dateTo = today;
-                periodName = 'За неделю';
-                break;
-            case 'month':
-                dateFrom = new Date(today);
-                dateFrom.setMonth(dateFrom.getMonth() - 1);
-                dateTo = today;
-                periodName = 'За месяц';
-                break;
-            case 'year':
-                dateFrom = null;
-                dateTo = null;
-                periodName = `За ${year} год`;
-                break;
-        }
-        
-        // Фильтруем данные
-        let income = yearData.income;
-        if (dateFrom && dateTo) {
-            income = income.filter(item => {
-                const itemDate = new Date(item.date);
-                return itemDate >= dateFrom && itemDate <= dateTo;
-            });
-        }
-        
-        if (income.length === 0) {
-            return ctx.reply(`📈 Нет данных о приходе за выбранный период`);
-        }
-        
-        // Формируем данные для отчёта
-        const items = income.map(item => ({
-            date: item.date || '',
-            wagon: item.wagon || '',
-            company: item.company || '',
-            warehouse: item.warehouse || '',
-            product: item.product || '',
-            qtyDoc: parseFloat(item.qtyDoc) || 0,
-            qtyFact: parseFloat(item.qtyFact) || 0,
-            difference: (parseFloat(item.qtyFact) || 0) - (parseFloat(item.qtyDoc) || 0),
-            weightTons: (parseFloat(item.qtyFact) || 0) / 20,
-            notes: item.notes || ''
-        }));
-        
-        // Сортируем по дате (новые сверху)
-        items.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        // Итоги
-        let totalDoc = 0, totalFact = 0, totalTons = 0;
-        items.forEach(item => {
-            totalDoc += item.qtyDoc;
-            totalFact += item.qtyFact;
-            totalTons += item.weightTons;
+        // Группируем по месяцам
+        const byMonth = {};
+        yearData.income.forEach(item => {
+            const date = new Date(item.date);
+            const month = date.toLocaleString('ru', { month: 'long' });
+            if (!byMonth[month]) byMonth[month] = { count: 0, tons: 0 };
+            byMonth[month].count++;
+            byMonth[month].tons += (item.qtyFact || 0) / 20;
         });
         
-        let msg = `📈 *ПРИХОД ТОВАРОВ*\n`;
-        msg += `📅 ${periodName}\n`;
-        msg += `${'═'.repeat(25)}\n\n`;
+        let msg = `📈 *ПРИХОД ЗА ${year}*\n${'─'.repeat(20)}\n\n`;
+        let totalTons = 0;
+        let totalCount = 0;
         
-        // Показываем до 15 записей
-        const showItems = items.slice(0, 15);
-        showItems.forEach((item, i) => {
-            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
-            msg += `${i + 1}. *${formattedDate}*\n`;
-            msg += `   🚂 ${item.wagon} | ${item.product}\n`;
-            msg += `   ${item.company} → ${item.warehouse}\n`;
-            msg += `   📄 ${item.qtyDoc} | ✅ ${item.qtyFact} | ⚖️ ${formatNumber(item.weightTons)} т\n\n`;
+        Object.entries(byMonth).forEach(([month, data]) => {
+            msg += `📅 *${month}*: ${data.count} записей, ${formatNumber(data.tons)} т\n`;
+            totalTons += data.tons;
+            totalCount += data.count;
         });
         
-        if (items.length > 15) {
-            msg += `_...и ещё ${items.length - 15} записей_\n\n`;
-        }
+        msg += `\n${'─'.repeat(20)}\n`;
+        msg += `📊 Всего: *${totalCount}* записей\n`;
+        msg += `📦 Итого: *${formatNumber(totalTons)} тонн*`;
         
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 *ИТОГО:* ${items.length} записей\n`;
-        msg += `   📄 По док: *${totalDoc}* шт\n`;
-        msg += `   ✅ Факт: *${totalFact}* шт\n`;
-        msg += `   📈 Разница: *${totalFact - totalDoc}* шт\n`;
-        msg += `   ⚖️ Вес: *${formatNumber(totalTons)} тонн*`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastIncomeReport = { items, periodName, year };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `exinc_${periodType}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
+        ctx.reply(msg, { parse_mode: 'Markdown' });
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт прихода в Excel
-bot.action(/^exinc_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastIncomeReport) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { items, periodName, year } = session.lastIncomeReport;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Приход товаров');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Вагон', key: 'wagon', width: 15 },
-            { header: 'Фирма', key: 'company', width: 18 },
-            { header: 'Склад', key: 'warehouse', width: 15 },
-            { header: 'Товар', key: 'product', width: 18 },
-            { header: 'По док', key: 'qtyDoc', width: 10 },
-            { header: 'Факт', key: 'qtyFact', width: 10 },
-            { header: 'Разница', key: 'difference', width: 10 },
-            { header: 'Вес (т)', key: 'weightTons', width: 10 },
-            { header: 'Примечания', key: 'notes', width: 25 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FF4CAF50' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        
-        // Данные
-        let totalDoc = 0, totalFact = 0, totalTons = 0;
-        items.forEach((item, i) => {
-            sheet.addRow({
-                num: i + 1,
-                date: item.date,
-                wagon: item.wagon,
-                company: item.company,
-                warehouse: item.warehouse,
-                product: item.product,
-                qtyDoc: item.qtyDoc,
-                qtyFact: item.qtyFact,
-                difference: item.difference,
-                weightTons: item.weightTons,
-                notes: item.notes
-            });
-            totalDoc += item.qtyDoc;
-            totalFact += item.qtyFact;
-            totalTons += item.weightTons;
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            date: '',
-            wagon: '',
-            company: '',
-            warehouse: '',
-            product: 'ИТОГО:',
-            qtyDoc: totalDoc,
-            qtyFact: totalFact,
-            difference: totalFact - totalDoc,
-            weightTons: totalTons,
-            notes: ''
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Сохраняем файл
-        const fileName = `income_${year}_${Date.now()}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: `Приход_${periodName}_${year}.xlsx` },
-            { caption: `📈 Приход товаров\n📅 ${periodName}\n📊 ${items.length} записей` }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
     }
 });
 
