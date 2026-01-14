@@ -2370,8 +2370,11 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка итогов вагонов...');
     try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        const rawData = await getData();
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
+        
+        // Фильтруем данные по группам складов пользователя
+        const data = filterDataByWarehouseGroup(rawData, userId);
         
         const wagonTotals = calculateWagonTotals(data, year);
         
