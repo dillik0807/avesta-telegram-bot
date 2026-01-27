@@ -1,0 +1,431 @@
+{
+  "1724754006": {
+    "authorized": true,
+    "username": "tillo",
+    "role": "warehouse",
+    "year": "2025",
+    "lastDailyReport": {
+      "dailyData": {
+        "income": [],
+        "expense": [],
+        "totals": {
+          "expenseSum": 0
+        }
+      },
+      "reportDate": "2026-01-11",
+      "formattedDate": "11.01.2026"
+    }
+  },
+  "5889669586": {
+    "authorized": true,
+    "username": "dilshod",
+    "role": "warehouse",
+    "year": "2026",
+    "lastDebtsReport": {
+      "items": [
+        {
+          "client": "Умед Хикматов",
+          "total": 194280,
+          "paid": 0,
+          "debt": 194280
+        },
+        {
+          "client": "Хуршед Якдоров",
+          "total": 74805,
+          "paid": 3975,
+          "debt": 70830
+        },
+        {
+          "client": "Мурод Ибрагимов",
+          "total": 66150,
+          "paid": 7697.93,
+          "debt": 58452.07
+        },
+        {
+          "client": "Наим Чумаев",
+          "total": 56436.4,
+          "paid": 0,
+          "debt": 56436.4
+        },
+        {
+          "client": "Маъруф Хакназаров (Регар)",
+          "total": 33939,
+          "paid": 0,
+          "debt": 33939
+        },
+        {
+          "client": "Хочи Сайфидин (Шартуз)",
+          "total": 36225,
+          "paid": 4000,
+          "debt": 32225
+        },
+        {
+          "client": "Абдурахмон Зиёев Гипрозем",
+          "total": 29214,
+          "paid": 0,
+          "debt": 29214
+        },
+        {
+          "client": "Файзали Бобоев (Э.Саттор)",
+          "total": 33018,
+          "paid": 5300,
+          "debt": 27718
+        },
+        {
+          "client": "Хочи Вохиб Вохидов (Кумсангир)",
+          "total": 29700,
+          "paid": 11880,
+          "debt": 17820
+        },
+        {
+          "client": "Карим Вохидов (Кумсангир)",
+          "total": 17010,
+          "paid": 0,
+          "debt": 17010
+        },
+        {
+          "client": "Хоким Муминов Ориф (Курган)",
+          "total": 17010,
+          "paid": 0,
+          "debt": 17010
+        },
+        {
+          "client": "Игамназаров Абдукодир (Ч.Балхи)",
+          "total": 17010,
+          "paid": 0,
+          "debt": 17010
+        },
+        {
+          "client": "Довуд Хучанд",
+          "total": 16685.5,
+          "paid": 0,
+          "debt": 16685.5
+        },
+        {
+          "client": "Асомидин Гоибов (Ворашил)",
+          "total": 35046,
+          "paid": 18900,
+          "debt": 16146
+        },
+        {
+          "client": "Ахтам Рачабов (Кабодиен)",
+          "total": 16110,
+          "paid": 0,
+          "debt": 16110
+        },
+        {
+          "client": "Хуснидин Кабодиен",
+          "total": 16075,
+          "paid": 0,
+          "debt": 16075
+        },
+        {
+          "client": "Сирочид Эшон Вахдат",
+          "total": 14040,
+          "paid": 0,
+          "debt": 14040
+        },
+        {
+          "client": "Саидакбар Саидов (Ч.Балхи)",
+          "total": 14040,
+          "paid": 0,
+          "debt": 14040
+        },
+        {
+          "client": "Самадов Хотамбек",
+          "total": 13750,
+          "paid": 0,
+          "debt": 13750
+        },
+        {
+          "client": "Зайнуллоев Дилшод",
+          "total": 32050,
+          "paid": 21200,
+          "debt": 10850
+        },
+        {
+          "client": "Маруф Мирбобоев",
+          "total": 298840,
+          "paid": 290256,
+          "debt": 8584
+        },
+        {
+          "client": "Мехроб Одинаев",
+          "total": 13500,
+          "paid": 7000,
+          "debt": 6500
+        },
+        {
+          "client": "Косимов Ориф",
+          "total": 13500,
+          "paid": 7600,
+          "debt": 5900
+        },
+        {
+          "client": "ФурушиНакди",
+          "total": 2800,
+          "paid": 0,
+          "debt": 2800
+        },
+        {
+          "client": "Бегназаров Бахром (Ч.Балхи)",
+          "total": 2700,
+          "paid": 0,
+          "debt": 2700
+        },
+        {
+          "client": "Алихонов Исроил",
+          "total": 4860,
+          "paid": 2160.22,
+          "debt": 2699.78
+        },
+        {
+          "client": "Ривочидин Куватов (Ч.Балхи)",
+          "total": 2685,
+          "paid": 0,
+          "debt": 2685
+        },
+        {
+          "client": "Муродов Илхом (Вахш)",
+          "total": 14040,
+          "paid": 14039.78,
+          "debt": 0.21999999999934516
+        }
+      ],
+      "year": "2026",
+      "totalDebt": 721509.97
+    },
+    "lastDailyReport": {
+      "dailyData": {
+        "income": [],
+        "expense": [
+          {
+            "date": "2026-01-13",
+            "client": "Самадов Хотамбек",
+            "company": "ООО ТарговыйДом",
+            "warehouse": "Хисор Шавкат",
+            "product": "Навои Селитра",
+            "quantity": 250,
+            "tons": 12.5,
+            "price": 560,
+            "total": 7000,
+            "notes": ""
+          },
+          {
+            "date": "2026-01-13",
+            "client": "Наим Чумаев",
+            "company": "ООО ТарговыйДом",
+            "warehouse": "Хисор Шавкат",
+            "product": "Навои Селитра",
+            "quantity": 500,
+            "tons": 25,
+            "price": 1,
+            "total": 25,
+            "notes": ""
+          }
+        ],
+        "totals": {
+          "expenseSum": 7025
+        }
+      },
+      "reportDate": "2026-01-13",
+      "formattedDate": "13.01.2026"
+    },
+    "lastPaymentsReport": {
+      "items": [
+        {
+          "date": "2026-01-06",
+          "client": "Мирзохон Мирзоев",
+          "amount": 53500,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2026-01-06",
+          "client": "Водии Зарин",
+          "amount": 150000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2026-01-06",
+          "client": "Мурод Ибрагимов",
+          "amount": 5387.93,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2026-01-06",
+          "client": "Чума Содиков (Регар)",
+          "amount": 66500,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2026-01-06",
+          "client": "Чума Содиков (Регар)",
+          "amount": 16.13,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2026-01-06",
+          "client": "Точидинов Сайдали",
+          "amount": 3763.44,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2026-01-05",
+          "client": "Точидинов Сайдали",
+          "amount": 1636.56,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2026-01-05",
+          "client": "Мехроб Одинаев",
+          "amount": 5000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2026-01-05",
+          "client": "Мехроб Одинаев",
+          "amount": 2000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-30",
+          "client": "Косимов Ориф",
+          "amount": 7600,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-29",
+          "client": "Шарипов Турахон",
+          "amount": 13400,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-29",
+          "client": "Шарипов Турахон",
+          "amount": 100,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-29",
+          "client": "Водии Зарин",
+          "amount": 100000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-29",
+          "client": "Асомидин Гоибов (Ворашил)",
+          "amount": 18900,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-29",
+          "client": "Зайнуллоев Дилшод",
+          "amount": 21200,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-26",
+          "client": "Водии Зарин",
+          "amount": 39200,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-24",
+          "client": "Шарипов Турахон",
+          "amount": 20000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-24",
+          "client": "Шарипов Турахон",
+          "amount": 7000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-24",
+          "client": "Алихонов Исроил",
+          "amount": 2160.22,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-22",
+          "client": "Водии Зарин",
+          "amount": 135000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-22",
+          "client": "Муродов Илхом (Вахш)",
+          "amount": 7200,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-22",
+          "client": "Муродов Илхом (Вахш)",
+          "amount": 39.78,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-22",
+          "client": "Хочи Вохиб Вохидов (Кумсангир)",
+          "amount": 11880,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-22",
+          "client": "Водии Зарин",
+          "amount": 230000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-15",
+          "client": "Олим Шопалов (Э.Саттор)",
+          "amount": 5400,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-15",
+          "client": "Водии Зарин",
+          "amount": 138000,
+          "notes": "",
+          "user": "firdavs"
+        },
+        {
+          "date": "2025-12-15",
+          "client": "Муродов Илхом (Вахш)",
+          "amount": 6800,
+          "notes": "",
+          "user": "firdavs"
+        }
+      ],
+      "periodName": "За месяц",
+      "year": "2026",
+      "totalSum": 1051684.06
+    }
+  }
+}
