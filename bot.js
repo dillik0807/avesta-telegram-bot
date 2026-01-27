@@ -1733,8 +1733,8 @@ bot.action(/^incdet_(today|yesterday|week|month|year)$/, async (ctx) => {
                 break;
         }
         
-        // Фильтруем данные
-        let income = yearData.income;
+        // Фильтруем данные (исключаем удаленные записи)
+        let income = yearData.income.filter(item => !item.isDeleted);
         if (dateFrom && dateTo) {
             income = income.filter(item => {
                 const itemDate = new Date(item.date);
@@ -2065,8 +2065,8 @@ bot.action(/^expdet_(today|yesterday|week|month|year)$/, async (ctx) => {
                 break;
         }
         
-        // Фильтруем данные
-        let expense = yearData.expense;
+        // Фильтруем данные (исключаем удаленные записи)
+        let expense = yearData.expense.filter(item => !item.isDeleted);
         if (dateFrom && dateTo) {
             expense = expense.filter(item => {
                 const itemDate = new Date(item.date);
@@ -2377,8 +2377,8 @@ bot.action(/^paydet_(today|yesterday|week|month|year)$/, async (ctx) => {
                 break;
         }
         
-        // Фильтруем данные
-        let payments = yearData.payments;
+        // Фильтруем данные (исключаем удаленные записи)
+        let payments = yearData.payments.filter(item => !item.isDeleted);
         if (dateFrom && dateTo) {
             payments = payments.filter(item => {
                 const itemDate = new Date(item.date);
