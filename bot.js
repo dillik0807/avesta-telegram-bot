@@ -2627,17 +2627,47 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка итогов вагонов...');
     try {
+        console.log(`🚂 Запрос итогов вагонов для пользователя ${userId}, год ${year}`);
+        
         const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
+        if (!rawData) {
+            console.log('❌ rawData is null');
+            return ctx.reply('❌ Не удалось получить данные');
+        }
+        
+        console.log('📡 Данные получены, ключи:', Object.keys(rawData));
         
         // Фильтруем данные по группам складов пользователя
         const data = filterDataByWarehouseGroup(rawData, userId);
+        console.log('🔍 Данные отфильтрованы');
+        
+        if (!data.years || !data.years[year]) {
+            console.log(`❌ Нет данных за год ${year}`);
+            return ctx.reply(`🚂 Нет данных за ${year} год`);
+        }
+        
+        if (!data.years[year].income) {
+            console.log(`❌ Нет данных о приходе за год ${year}`);
+            return ctx.reply(`🚂 Нет данных о приходе за ${year} год`);
+        }
+        
+        console.log(`📦 Записей прихода за ${year}: ${data.years[year].income.length}`);
+        const activeIncome = data.years[year].income.filter(item => !item.isDeleted);
+        console.log(`📦 Активных записей прихода: ${activeIncome.length}`);
         
         const wagonTotals = calculateWagonTotals(data, year);
         
-        if (!wagonTotals || wagonTotals.items.length === 0) {
+        if (!wagonTotals) {
+            console.log('❌ calculateWagonTotals returned null');
+            return ctx.reply(`🚂 Ошибка расчета итогов вагонов за ${year} год`);
+        }
+        
+        if (wagonTotals.items.length === 0) {
+            console.log('❌ wagonTotals.items is empty');
             return ctx.reply(`🚂 Нет данных о вагонах за ${year} год`);
         }
+        
+        console.log(`✅ Найдено позиций: ${wagonTotals.items.length}`);
 
         let msg = `🚂 *ИТОГИ ВАГОНОВ*\n📅 ${year}\n${'═'.repeat(25)}\n\n`;
         
@@ -2684,6 +2714,8 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
         msg += `   Разница: *${wagonTotals.totals.difference}* шт\n`;
         msg += `   Вес: *${formatNumber(wagonTotals.totals.weightTons)} тонн*`;
         
+        console.log(`📤 Отправляем сообщение длиной ${msg.length} символов`);
+        
         if (msg.length > 4000) {
             const parts = msg.match(/[\s\S]{1,4000}/g);
             for (const part of parts) {
@@ -2693,8 +2725,9 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
             ctx.reply(msg, { parse_mode: 'Markdown' });
         }
     } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
+        console.error('❌ Ошибка в итогах вагонов:', e);
+        console.error('Stack trace:', e.stack);
+        ctx.reply(`❌ Ошибка загрузки данных: ${e.message}`);
     }
 });
 
