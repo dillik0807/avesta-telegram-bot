@@ -19,6 +19,11 @@ console.log('🔧 Исправления Telegram Bot загружены');
 const clientNotifications = require('./client-notifications');
 console.log('📢 Модуль уведомлений о клиентах загружен');
 
+// 🔔 Настройки автоматических уведомлений
+const NOTIFICATION_TIME = '09:00'; // Время отправки уведомлений (09:00)
+const NOTIFICATION_DAYS = [7, 14]; // Дни для проверки (7 и 14 дней назад)
+let notificationInterval = null;
+
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const FIREBASE_URL = process.env.FIREBASE_DATABASE_URL;
 const DEFAULT_YEAR = '2026';
