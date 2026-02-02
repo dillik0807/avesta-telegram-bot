@@ -233,6 +233,48 @@ const getData = () => new Promise(async (resolve, reject) => {
     }).on('error', reject);
 });
 
+// Функция экранирования специальных символов Markdown (только в пользовательском контенте)
+const escapeMarkdown = (text) => {
+    if (!text) return '';
+    return text.toString()
+        .replace(/\\/g, '\\\\')  // Сначала экранируем обратные слеши
+        .replace(/\*/g, '\\*')   // Звездочки
+        .replace(/_/g, '\\_')    // Подчеркивания
+        .replace(/\[/g, '\\[')   // Квадратные скобки
+        .replace(/\]/g, '\\]')
+        .replace(/\(/g, '\\(')   // Круглые скобки
+        .replace(/\)/g, '\\)')
+        .replace(/~/g, '\\~')    // Тильда
+        .replace(/`/g, '\\`')    // Обратные кавычки
+        .replace(/>/g, '\\>')    // Больше
+        .replace(/#/g, '\\#')    // Решетка
+        .replace(/\+/g, '\\+')   // Плюс
+        .replace(/-/g, '\\-')    // Минус
+        .replace(/=/g, '\\=')    // Равно
+        .replace(/\|/g, '\\|')   // Вертикальная черта
+        .replace(/\{/g, '\\{')   // Фигурные скобки
+        .replace(/\}/g, '\\}')
+        .replace(/\./g, '\\.')   // Точка
+        .replace(/!/g, '\\!');   // Восклицательный знак
+};
+
+// Безопасная отправка сообщения с Markdown
+const sendMarkdownMessage = async (ctx, message) => {
+    try {
+        await ctx.reply(message, { parse_mode: 'Markdown' });
+    } catch (error) {
+        console.log('⚠️ Ошибка парсинга Markdown:', error.message);
+        console.log('📤 Отправляем как обычный текст');
+        // Убираем все Markdown форматирование и отправляем как обычный текст
+        const plainText = message
+            .replace(/\*([^*]+)\*/g, '$1')  // Убираем жирный текст
+            .replace(/_([^_]+)_/g, '$1')    // Убираем курсив
+            .replace(/`([^`]+)`/g, '$1')    // Убираем моноширинный текст
+            .replace(/\\(.)/g, '$1');       // Убираем экранирование
+        await ctx.reply(plainText);
+    }
+};
+
 // Форматирование чисел (используем безопасную версию)
 const formatNumber = (num) => {
     // 🔧 Используем безопасную функцию из модуля исправлений
@@ -2681,13 +2723,13 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
         });
         
         Object.entries(byWarehouse).sort().forEach(([warehouse, items]) => {
-            msg += `🏪 *${warehouse}*\n`;
+            msg += `🏪 *${escapeMarkdown(warehouse)}*\n`;
             msg += `${'─'.repeat(20)}\n`;
             
             let whWagons = 0, whDoc = 0, whFact = 0, whTons = 0;
             
             items.forEach(item => {
-                msg += `📦 ${item.product} (${item.company})\n`;
+                msg += `📦 ${escapeMarkdown(item.product)} (${escapeMarkdown(item.company)})\n`;
                 msg += `   🚂 Вагонов: ${item.wagons}\n`;
                 msg += `   📄 По док: ${item.qtyDoc} шт\n`;
                 msg += `   ✅ Факт: ${item.qtyFact} шт\n`;
@@ -2702,7 +2744,7 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
                 whTons += item.weightTons;
             });
             
-            msg += `📊 *Итого ${warehouse}:*\n`;
+            msg += `📊 *Итого ${escapeMarkdown(warehouse)}:*\n`;
             msg += `   🚂 ${whWagons} вагонов, ⚖️ ${formatNumber(whTons)} т\n\n`;
         });
         
@@ -2719,10 +2761,10 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
         if (msg.length > 4000) {
             const parts = msg.match(/[\s\S]{1,4000}/g);
             for (const part of parts) {
-                await ctx.reply(part, { parse_mode: 'Markdown' });
+                await sendMarkdownMessage(ctx, part);
             }
         } else {
-            ctx.reply(msg, { parse_mode: 'Markdown' });
+            await sendMarkdownMessage(ctx, msg);
         }
     } catch (e) {
         console.error('❌ Ошибка в итогах вагонов:', e);
