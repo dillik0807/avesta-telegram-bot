@@ -15,6 +15,10 @@ const path = require('path');
 const botFixes = require('./fix-telegram-bot-all');
 console.log('🔧 Исправления Telegram Bot загружены');
 
+// 📢 Загружаем модуль уведомлений о клиентах
+const clientNotifications = require('./client-notifications');
+console.log('📢 Модуль уведомлений о клиентах загружен');
+
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const FIREBASE_URL = process.env.FIREBASE_DATABASE_URL;
 const DEFAULT_YEAR = '2026';
@@ -550,8 +554,8 @@ const adminKeyboard = Markup.keyboard([
 const reportsKeyboard = Markup.keyboard([
     ['📈 Приход за период', '📉 Расход за период'],
     ['💵 Погашения за период', '👥 Топ должников'],
-    ['🚂 Итоги вагонов', ' Карточка клиента'],
-    ['🔙 Назад']
+    ['🚂 Итоги вагонов', '👤 Карточка клиента'],
+    ['🔔 Уведомления о долгах', '🔙 Назад']
 ]).resize();
 const managementKeyboard = Markup.keyboard([
     ['👥 Пользователи', '📦 Товары'],
@@ -3495,6 +3499,210 @@ function calculateClientCard(data, year, clientName) {
         payments
     };
 }
+
+// 🔔 Уведомления о долгах - клиенты, которые покупали N дней назад
+bot.hears(/🔔|уведомления о долгах/i, async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    
+    // Показываем кнопки выбора количества дней
+    const daysButtons = Markup.inlineKeyboard([
+        [Markup.button.callback('📅 7 дней назад', 'notify_7')],
+        [Markup.button.callback('📅 14 дней назад', 'notify_14')],
+        [Markup.button.callback('📅 30 дней назад', 'notify_30')]
+    ]);
+    
+    ctx.reply(
+        `🔔 *УВЕДОМЛЕНИЯ О ДОЛГАХ*\n📅 Год: *${year}*\n\nВыберите период:\n_Показать клиентов с долгами, которые покупали:_`,
+        { parse_mode: 'Markdown', ...daysButtons }
+    );
+});
+
+// Обработка выбора периода для уведомлений
+bot.action(/^notify_(\d+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    const daysAgo = parseInt(ctx.match[1]);
+    
+    await ctx.answerCbQuery('⏳ Поиск должников...');
+    
+    try {
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        
+        const debtorsWithPurchases = clientNotifications.findDebtorsWithPurchaseOnDate(data, year, daysAgo);
+        
+        if (debtorsWithPurchases.length === 0) {
+            return ctx.reply(`✅ Нет должников, которые покупали ${daysAgo} дней назад`);
+        }
+        
+        // Формируем дату покупки
+        const targetDate = new Date();
+        targetDate.setDate(targetDate.getDate() - daysAgo);
+        const formattedDate = targetDate.toLocaleDateString('ru-RU');
+        
+        let msg = `🔔 *УВЕДОМЛЕНИЯ О ДОЛГАХ*\n`;
+        msg += `📅 Клиенты, которые покупали ${formattedDate} (${daysAgo} дней назад)\n`;
+        msg += `${'═'.repeat(30)}\n\n`;
+        
+        let totalDebt = 0;
+        let totalNotificationAmount = 0;
+        
+        debtorsWithPurchases.forEach((debtor, i) => {
+            msg += `${i + 1}. 👤 *${debtor.client}*\n`;
+            msg += `   💳 Общий долг: *${clientNotifications.formatNumber(debtor.debt)} $*\n`;
+            
+            // Показываем покупки за указанную дату
+            msg += `   📦 Покупки ${formattedDate}:\n`;
+            debtor.purchases.forEach(purchase => {
+                msg += `      • ${purchase.product} - ${purchase.quantity} шт (${clientNotifications.formatNumber(purchase.total)} $)\n`;
+            });
+            msg += `   💰 Сумма покупок в тот день: *${clientNotifications.formatNumber(debtor.totalPurchaseAmount)} $*\n\n`;
+            
+            totalDebt += debtor.debt;
+            totalNotificationAmount += debtor.totalPurchaseAmount;
+        });
+        
+        msg += `${'═'.repeat(30)}\n`;
+        msg += `📊 *ИТОГО:*\n`;
+        msg += `   👥 Должников: *${debtorsWithPurchases.length}*\n`;
+        msg += `   💳 Общий долг: *${clientNotifications.formatNumber(totalDebt)} $*\n`;
+        msg += `   💰 Сумма покупок ${formattedDate}: *${clientNotifications.formatNumber(totalNotificationAmount)} $*\n\n`;
+        msg += `⚠️ _Рекомендуется связаться с этими клиентами для напоминания о долге_`;
+        
+        // Сохраняем данные для экспорта
+        sessions[userId].lastDebtNotifications = { 
+            debtorsWithPurchases, 
+            daysAgo, 
+            formattedDate, 
+            year,
+            totalDebt,
+            totalNotificationAmount
+        };
+        saveSessions();
+        
+        // Кнопка экспорта
+        const exportButton = Markup.inlineKeyboard([
+            [Markup.button.callback('📊 Экспорт в Excel', `exnotify_${daysAgo}`)]
+        ]);
+        
+        if (msg.length > 4000) {
+            const parts = msg.match(/[\s\S]{1,4000}/g);
+            for (let i = 0; i < parts.length - 1; i++) {
+                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
+            }
+            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
+        } else {
+            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
+        }
+        
+    } catch (e) {
+        console.error('Ошибка уведомлений:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Экспорт уведомлений о долгах в Excel
+bot.action(/^exnotify_(\d+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const session = getSession(userId);
+    
+    if (!session.lastDebtNotifications) {
+        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
+    }
+    
+    await ctx.answerCbQuery('📊 Создание Excel файла...');
+    
+    const { debtorsWithPurchases, daysAgo, formattedDate, year, totalDebt, totalNotificationAmount } = session.lastDebtNotifications;
+    
+    try {
+        const workbook = new ExcelJS.Workbook();
+        const sheet = workbook.addWorksheet('Уведомления о долгах');
+        
+        // Заголовки
+        sheet.columns = [
+            { header: '№', key: 'num', width: 5 },
+            { header: 'Клиент', key: 'client', width: 25 },
+            { header: 'Общий долг ($)', key: 'totalDebt', width: 15 },
+            { header: 'Покупки в тот день ($)', key: 'dayPurchases', width: 20 },
+            { header: 'Товары', key: 'products', width: 30 },
+            { header: 'Склады', key: 'warehouses', width: 20 }
+        ];
+        
+        // Стиль заголовков
+        sheet.getRow(1).font = { bold: true };
+        sheet.getRow(1).fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFFF9800' }
+        };
+        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        
+        // Данные
+        debtorsWithPurchases.forEach((debtor, i) => {
+            const products = debtor.purchases.map(p => `${p.product} (${p.quantity} шт)`).join(', ');
+            const warehouses = [...new Set(debtor.purchases.map(p => p.warehouse))].join(', ');
+            
+            const row = sheet.addRow({
+                num: i + 1,
+                client: debtor.client,
+                totalDebt: debtor.debt,
+                dayPurchases: debtor.totalPurchaseAmount,
+                products: products,
+                warehouses: warehouses
+            });
+            
+            // Подсветка больших долгов
+            if (debtor.debt > 5000) {
+                row.getCell('totalDebt').fill = {
+                    type: 'pattern',
+                    pattern: 'solid',
+                    fgColor: { argb: 'FFFFCDD2' }
+                };
+            }
+        });
+        
+        // Итоговая строка
+        const totalRow = sheet.addRow({
+            num: '',
+            client: 'ИТОГО:',
+            totalDebt: totalDebt,
+            dayPurchases: totalNotificationAmount,
+            products: '',
+            warehouses: ''
+        });
+        totalRow.font = { bold: true };
+        totalRow.fill = {
+            type: 'pattern',
+            pattern: 'solid',
+            fgColor: { argb: 'FFEEEEEE' }
+        };
+        
+        // Форматирование числовых колонок
+        sheet.getColumn('totalDebt').numFmt = '#,##0.00';
+        sheet.getColumn('dayPurchases').numFmt = '#,##0.00';
+        
+        // Сохраняем файл
+        const fileName = `Уведомления_о_долгах_${daysAgo}_дней_${year}.xlsx`;
+        const filePath = path.join(__dirname, fileName);
+        await workbook.xlsx.writeFile(filePath);
+        
+        // Отправляем файл
+        await ctx.replyWithDocument(
+            { source: filePath, filename: fileName },
+            { 
+                caption: `🔔 Уведомления о долгах\n📅 Покупки ${formattedDate} (${daysAgo} дней назад)\n👥 ${debtorsWithPurchases.length} должников\n💳 Общий долг: ${clientNotifications.formatNumber(totalDebt)} $` 
+            }
+        );
+        
+        // Удаляем временный файл
+        fs.unlinkSync(filePath);
+        
+    } catch (e) {
+        console.error('Ошибка экспорта:', e);
+        ctx.reply('❌ Ошибка создания Excel файла');
+    }
+});
 
 // Остатки складов
 bot.hears(/📦|\/stock|остатки складов/i, async (ctx) => {
