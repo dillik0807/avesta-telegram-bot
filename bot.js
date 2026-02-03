@@ -1288,17 +1288,19 @@ bot.hears(/👤 Клиенты/i, async (ctx) => {
         let clientNames = [];
         if (Array.isArray(data.clients)) {
             data.clients.forEach(c => {
+                // Фильтруем удаленных клиентов
                 if (typeof c === 'string') {
                     clientNames.push(c);
-                } else if (c && c.name) {
+                } else if (c && c.name && !c.isDeleted) {
                     clientNames.push(c.name);
                 }
             });
         } else if (typeof data.clients === 'object') {
             Object.values(data.clients).forEach(c => {
+                // Фильтруем удаленных клиентов
                 if (typeof c === 'string') {
                     clientNames.push(c);
-                } else if (c && c.name) {
+                } else if (c && c.name && !c.isDeleted) {
                     clientNames.push(c.name);
                 }
             });
@@ -1312,15 +1314,10 @@ bot.hears(/👤 Клиенты/i, async (ctx) => {
         if (clientNames.length === 0) {
             msg += `_Список пуст_\n`;
         } else {
-            // Показываем первые 50 клиентов
-            const showClients = clientNames.slice(0, 50);
-            showClients.forEach((client, i) => {
+            // Показываем всех клиентов (убираем лимит 50)
+            clientNames.forEach((client, i) => {
                 msg += `${i + 1}. ${client}\n`;
             });
-            
-            if (clientNames.length > 50) {
-                msg += `\n_...и ещё ${clientNames.length - 50} клиентов_\n`;
-            }
         }
         
         msg += `\n${'═'.repeat(25)}\n`;
@@ -3276,9 +3273,10 @@ bot.hears(/👤|карточка клиента/i, async (ctx) => {
         // Если clients - массив
         if (Array.isArray(data.clients)) {
             data.clients.forEach(c => {
+                // Фильтруем удаленных клиентов
                 if (typeof c === 'string') {
                     clientNames.push(c);
-                } else if (c && c.name) {
+                } else if (c && c.name && !c.isDeleted) {
                     clientNames.push(c.name);
                 }
             });
@@ -3286,15 +3284,16 @@ bot.hears(/👤|карточка клиента/i, async (ctx) => {
         // Если clients - объект
         else if (data.clients && typeof data.clients === 'object') {
             Object.values(data.clients).forEach(c => {
+                // Фильтруем удаленных клиентов
                 if (typeof c === 'string') {
                     clientNames.push(c);
-                } else if (c && c.name) {
+                } else if (c && c.name && !c.isDeleted) {
                     clientNames.push(c.name);
                 }
             });
         }
         
-        // Также собираем клиентов из расходов
+        // Также собираем клиентов из расходов (только неудаленные записи)
         const yearData = data?.years?.[year];
         if (yearData && yearData.expense) {
             yearData.expense.filter(e => !e.isDeleted).forEach(e => {
@@ -3315,8 +3314,8 @@ bot.hears(/👤|карточка клиента/i, async (ctx) => {
         sessions[userId].clientsList = clientNames;
         saveSessions();
         
-        // Создаём inline кнопки для клиентов (максимум 50)
-        const buttons = clientNames.slice(0, 50).map((client, index) => {
+        // Создаём inline кнопки для всех клиентов (убираем лимит 50)
+        const buttons = clientNames.map((client, index) => {
             const shortName = client.length > 25 ? client.substring(0, 22) + '...' : client;
             return [Markup.button.callback(`👤 ${shortName}`, `cl_${index}`)];
         });
@@ -3536,8 +3535,8 @@ function calculateClientCard(data, year, clientName) {
     let totalSum = 0;
     let totalPaid = 0;
     
-    // Собираем покупки
-    (yearData.expense || []).forEach(e => {
+    // Собираем покупки (только неудаленные записи)
+    (yearData.expense || []).filter(e => !e.isDeleted).forEach(e => {
         if (e.client === clientName) {
             const tons = (e.quantity || 0) / 20;
             purchases.push({
@@ -3554,8 +3553,8 @@ function calculateClientCard(data, year, clientName) {
         }
     });
     
-    // Собираем платежи
-    (yearData.payments || []).forEach(p => {
+    // Собираем платежи (только неудаленные записи)
+    (yearData.payments || []).filter(p => !p.isDeleted).forEach(p => {
         if (p.client === clientName) {
             payments.push({
                 date: p.date || '',
