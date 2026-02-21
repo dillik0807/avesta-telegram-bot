@@ -4462,17 +4462,21 @@ bot.hears(/📤|расход за день/i, async (ctx) => {
             }
         });
         
-        // Группируем по группам складов
+        // Группируем по группам складов и товарам (без складов в названии)
         const groupedExpense = {};
         Object.entries(expenseByWarehouse).forEach(([warehouse, products]) => {
             const group = warehouseGroups[warehouse] || 'Без группы';
             if (!groupedExpense[group]) {
                 groupedExpense[group] = {};
             }
-            if (!groupedExpense[group][warehouse]) {
-                groupedExpense[group][warehouse] = {};
-            }
-            groupedExpense[group][warehouse] = products;
+            
+            // Суммируем товары по группе (без привязки к складу)
+            Object.entries(products).forEach(([product, tons]) => {
+                if (!groupedExpense[group][product]) {
+                    groupedExpense[group][product] = 0;
+                }
+                groupedExpense[group][product] += tons;
+            });
         });
         
         // Формируем сообщение - показываем расход по группам
@@ -4480,31 +4484,26 @@ bot.hears(/📤|расход за день/i, async (ctx) => {
         let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate}\n${'═'.repeat(25)}\n\n`;
         
         let grandTotal = 0;
+        const totalByProduct = {}; // Для итогов по товарам
         
         // Выводим расход по группам складов
-        Object.entries(groupedExpense).sort().forEach(([group, warehouses]) => {
+        Object.entries(groupedExpense).sort().forEach(([group, products]) => {
             msg += `📁 *${group}*\n`;
             msg += `${'─'.repeat(20)}\n`;
             
             let groupTotal = 0;
             
-            // Собираем все товары по группе
-            const groupProducts = {};
-            Object.entries(warehouses).forEach(([warehouse, products]) => {
-                Object.entries(products).forEach(([product, tons]) => {
-                    const key = `${warehouse} ${product}`;
-                    if (!groupProducts[key]) {
-                        groupProducts[key] = 0;
-                    }
-                    groupProducts[key] += tons;
-                });
-            });
-            
             // Выводим товары группы
-            Object.entries(groupProducts).sort().forEach(([productKey, tons]) => {
+            Object.entries(products).sort().forEach(([product, tons]) => {
                 if (tons > 0.01) {
-                    msg += `${productKey}\t${formatNumber(tons)} т/н\n`;
+                    msg += `${product}\t${formatNumber(tons)} т/н\n`;
                     groupTotal += tons;
+                    
+                    // Суммируем для общих итогов по товарам
+                    if (!totalByProduct[product]) {
+                        totalByProduct[product] = 0;
+                    }
+                    totalByProduct[product] += tons;
                 }
             });
             
@@ -4514,6 +4513,16 @@ bot.hears(/📤|расход за день/i, async (ctx) => {
         
         msg += `${'═'.repeat(25)}\n`;
         msg += `💰 *Всего: ${formatNumber(grandTotal)} т*\n\n`;
+        
+        // Добавляем итоги по товарам
+        if (Object.keys(totalByProduct).length > 0) {
+            msg += `📦 *ИТОГО ПО ТОВАРАМ:*\n`;
+            msg += `${'─'.repeat(20)}\n`;
+            Object.entries(totalByProduct).sort().forEach(([product, tons]) => {
+                msg += `${product}\t${formatNumber(tons)} т/н\n`;
+            });
+            msg += `\n`;
+        }
         
         // Создаем inline кнопки для фильтрации по группам
         const groupButtons = [];
@@ -4578,25 +4587,15 @@ bot.action(/^expense_group_(.+)$/, async (ctx) => {
     
     let groupTotal = 0;
     
-    // Выводим по складам в группе
-    Object.entries(groupedExpense[selectedGroup]).sort().forEach(([warehouse, products]) => {
-        msg += `🏪 *${warehouse}*\n`;
-        msg += `${'─'.repeat(20)}\n`;
-        
-        let warehouseTotal = 0;
-        
-        Object.entries(products).sort().forEach(([product, tons]) => {
-            if (tons > 0.01) {
-                msg += `${product}\t${formatNumber(tons)} т/н\n`;
-                warehouseTotal += tons;
-            }
-        });
-        
-        msg += `_Итого: ${formatNumber(warehouseTotal)} т_\n\n`;
-        groupTotal += warehouseTotal;
+    // Выводим товары группы (без разбивки по складам)
+    Object.entries(groupedExpense[selectedGroup]).sort().forEach(([product, tons]) => {
+        if (tons > 0.01) {
+            msg += `${product}\t${formatNumber(tons)} т/н\n`;
+            groupTotal += tons;
+        }
     });
     
-    msg += `${'═'.repeat(25)}\n`;
+    msg += `\n${'═'.repeat(25)}\n`;
     msg += `📊 *Итого ${selectedGroup}: ${formatNumber(groupTotal)} т*`;
     
     // Кнопка "Назад"
