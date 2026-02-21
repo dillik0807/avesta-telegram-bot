@@ -584,8 +584,8 @@ const adminKeyboard = Markup.keyboard([
 const reportsKeyboard = Markup.keyboard([
     ['📈 Приход за период', '📉 Расход за период'],
     ['💵 Погашения за период', '👥 Топ должников'],
-    ['🚂 Итоги вагонов', ' Карточка клиента'],
-    ['🔙 Назад']
+    ['🚂 Итоги вагонов', '👤 Карточка клиента'],
+    ['🔔 Уведомления о долгах', '🔙 Назад']
 ]).resize();
 const managementKeyboard = Markup.keyboard([
     ['👥 Пользователи', '📦 Товары'],
@@ -2639,6 +2639,112 @@ bot.hears(/👥|топ должников/i, async (ctx) => {
         msg += `💰 Всего долгов: *${formatNumber(allDebts)} $*`;
         
         ctx.reply(msg, { parse_mode: 'Markdown' });
+    } catch (e) {
+        console.error('Ошибка:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Уведомления о долгах
+bot.hears(/🔔|уведомления о долгах/i, async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    
+    await ctx.reply('⏳ Формирование списка должников...');
+    try {
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        
+        const debts = calculateDebts(data, year);
+        if (!debts || !Object.keys(debts).length) {
+            return ctx.reply(`✅ Нет должников за ${year} год!`);
+        }
+        
+        // Фильтруем только должников с долгом > 0
+        const debtors = Object.entries(debts)
+            .filter(([_, d]) => d.debt > 0)
+            .sort((a, b) => b[1].debt - a[1].debt);
+        
+        if (debtors.length === 0) {
+            return ctx.reply(`✅ Нет должников за ${year} год!`);
+        }
+        
+        let msg = `🔔 *УВЕДОМЛЕНИЯ О ДОЛГАХ*\n📅 ${year}\n${'═'.repeat(25)}\n\n`;
+        msg += `📊 Всего должников: *${debtors.length}*\n\n`;
+        
+        // Группируем по размеру долга
+        const critical = debtors.filter(([_, d]) => d.debt >= 10000); // >= 10,000$
+        const high = debtors.filter(([_, d]) => d.debt >= 5000 && d.debt < 10000); // 5,000-10,000$
+        const medium = debtors.filter(([_, d]) => d.debt >= 1000 && d.debt < 5000); // 1,000-5,000$
+        const low = debtors.filter(([_, d]) => d.debt < 1000); // < 1,000$
+        
+        if (critical.length > 0) {
+            msg += `🔴 *КРИТИЧЕСКИЙ ДОЛГ (≥10,000$)*\n`;
+            msg += `Клиентов: ${critical.length}\n`;
+            msg += `${'─'.repeat(20)}\n`;
+            critical.slice(0, 5).forEach(([client, d]) => {
+                msg += `• *${client}*: ${formatNumber(d.debt)} $\n`;
+            });
+            if (critical.length > 5) {
+                msg += `  _...и еще ${critical.length - 5}_\n`;
+            }
+            msg += `\n`;
+        }
+        
+        if (high.length > 0) {
+            msg += `🟠 *ВЫСОКИЙ ДОЛГ (5,000-10,000$)*\n`;
+            msg += `Клиентов: ${high.length}\n`;
+            msg += `${'─'.repeat(20)}\n`;
+            high.slice(0, 5).forEach(([client, d]) => {
+                msg += `• *${client}*: ${formatNumber(d.debt)} $\n`;
+            });
+            if (high.length > 5) {
+                msg += `  _...и еще ${high.length - 5}_\n`;
+            }
+            msg += `\n`;
+        }
+        
+        if (medium.length > 0) {
+            msg += `🟡 *СРЕДНИЙ ДОЛГ (1,000-5,000$)*\n`;
+            msg += `Клиентов: ${medium.length}\n`;
+            msg += `${'─'.repeat(20)}\n`;
+            medium.slice(0, 3).forEach(([client, d]) => {
+                msg += `• *${client}*: ${formatNumber(d.debt)} $\n`;
+            });
+            if (medium.length > 3) {
+                msg += `  _...и еще ${medium.length - 3}_\n`;
+            }
+            msg += `\n`;
+        }
+        
+        if (low.length > 0) {
+            msg += `🟢 *НИЗКИЙ ДОЛГ (<1,000$)*\n`;
+            msg += `Клиентов: ${low.length}\n\n`;
+        }
+        
+        // Общая статистика
+        const totalDebt = debtors.reduce((sum, [_, d]) => sum + d.debt, 0);
+        msg += `${'═'.repeat(25)}\n`;
+        msg += `💰 *ОБЩАЯ СУММА ДОЛГОВ:*\n`;
+        msg += `${formatNumber(totalDebt)} $\n\n`;
+        
+        msg += `📝 *Рекомендации:*\n`;
+        if (critical.length > 0) {
+            msg += `• Срочно связаться с ${critical.length} клиентами (критический долг)\n`;
+        }
+        if (high.length > 0) {
+            msg += `• Напомнить ${high.length} клиентам о погашении\n`;
+        }
+        msg += `\n💡 _Используйте "👤 Карточка клиента" для детальной информации_`;
+        
+        if (msg.length > 4000) {
+            const parts = msg.match(/[\s\S]{1,4000}/g);
+            for (const part of parts) {
+                await ctx.reply(part, { parse_mode: 'Markdown' });
+            }
+        } else {
+            ctx.reply(msg, { parse_mode: 'Markdown' });
+        }
     } catch (e) {
         console.error('Ошибка:', e);
         ctx.reply('❌ Ошибка загрузки данных');
