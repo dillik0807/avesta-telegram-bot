@@ -587,16 +587,17 @@ const loginKeyboard = Markup.keyboard([['🔐 Войти']]).resize();
 const mainKeyboard = Markup.keyboard([
     ['📦 Остатки складов', '🏭 Фактический остаток'],
     ['💰 Долги клиентов', '📊 Сводка'],
-    ['📅 Отчёт за день', '📋 Отчёты'],
-    ['📆 Сменить год', '🚪 Выйти']
+    ['📅 Отчёт за день', '📤 Расход за день'],
+    ['📋 Отчёты', '📆 Сменить год'],
+    ['🚪 Выйти']
 ]).resize();
 // Клавиатура для администраторов (с кнопкой Управление)
 const adminKeyboard = Markup.keyboard([
     ['📦 Остатки складов', '🏭 Фактический остаток'],
     ['💰 Долги клиентов', '📊 Сводка'],
-    ['📅 Отчёт за день', '📋 Отчёты'],
-    ['⚙️ Управление', '📆 Сменить год'],
-    ['🚪 Выйти']
+    ['📅 Отчёт за день', '📤 Расход за день'],
+    ['📋 Отчёты', '⚙️ Управление'],
+    ['📆 Сменить год', '🚪 Выйти']
 ]).resize();
 const reportsKeyboard = Markup.keyboard([
     ['📈 Приход за период', '📉 Расход за период'],
@@ -4399,6 +4400,201 @@ bot.action(/^exdaily_(.+)$/, async (ctx) => {
         console.error('Ошибка экспорта:', e);
         ctx.reply('❌ Ошибка создания Excel файла');
     }
+});
+
+// Расход за день - главное меню
+bot.hears(/📤|расход за день/i, async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    
+    await ctx.reply('⏳ Загрузка расхода за день...');
+    
+    try {
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        
+        const yearData = data?.years?.[year];
+        if (!yearData || !yearData.expense) {
+            return ctx.reply(`📤 Нет данных о расходе за ${year} год`);
+        }
+        
+        // Получаем сегодняшнюю дату
+        const today = new Date().toISOString().split('T')[0];
+        
+        // Фильтруем расходы только за сегодня
+        const todayExpense = (yearData.expense || [])
+            .filter(item => !item.isDeleted && item.date === today);
+        
+        if (todayExpense.length === 0) {
+            return ctx.reply(`📤 Сегодня расходов не было\n📅 ${new Date().toLocaleDateString('ru-RU')}`);
+        }
+        
+        // Группируем по складам и товарам
+        const expenseByWarehouse = {};
+        const expenseByProduct = {};
+        
+        todayExpense.forEach(item => {
+            const warehouse = item.warehouse || 'Без склада';
+            const product = item.product || 'Без товара';
+            const tons = (parseFloat(item.quantity) || 0) / 20;
+            
+            // По складам
+            if (!expenseByWarehouse[warehouse]) {
+                expenseByWarehouse[warehouse] = {};
+            }
+            if (!expenseByWarehouse[warehouse][product]) {
+                expenseByWarehouse[warehouse][product] = 0;
+            }
+            expenseByWarehouse[warehouse][product] += tons;
+            
+            // По товарам (общий)
+            if (!expenseByProduct[product]) {
+                expenseByProduct[product] = 0;
+            }
+            expenseByProduct[product] += tons;
+        });
+        
+        // Получаем группы складов
+        const warehouseGroups = {};
+        (data.warehouses || []).forEach(w => {
+            if (w.name && w.group) {
+                warehouseGroups[w.name] = w.group;
+            }
+        });
+        
+        // Группируем по группам складов
+        const groupedExpense = {};
+        Object.entries(expenseByWarehouse).forEach(([warehouse, products]) => {
+            const group = warehouseGroups[warehouse] || 'Без группы';
+            if (!groupedExpense[group]) {
+                groupedExpense[group] = {};
+            }
+            if (!groupedExpense[group][warehouse]) {
+                groupedExpense[group][warehouse] = {};
+            }
+            groupedExpense[group][warehouse] = products;
+        });
+        
+        // Формируем сообщение
+        const formattedDate = new Date().toLocaleDateString('ru-RU');
+        let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate}\n${'═'.repeat(25)}\n\n`;
+        
+        let grandTotal = 0;
+        
+        // Выводим общий список по товарам
+        msg += `📦 *ОБЩИЙ РАСХОД:*\n`;
+        msg += `${'─'.repeat(20)}\n`;
+        Object.entries(expenseByProduct).sort().forEach(([product, tons]) => {
+            if (tons > 0.01) {
+                msg += `${product}\t${formatNumber(tons)} т/н (${year})\n`;
+                grandTotal += tons;
+            }
+        });
+        
+        msg += `\n💰 *Всего: ${formatNumber(grandTotal)} т*\n\n`;
+        
+        // Создаем inline кнопки для фильтрации по группам
+        const groupButtons = [];
+        const groups = Object.keys(groupedExpense).sort();
+        
+        groups.forEach(group => {
+            groupButtons.push([Markup.button.callback(`📁 ${group}`, `expense_group_${Buffer.from(group).toString('base64')}`)]);
+        });
+        
+        groupButtons.push([Markup.button.callback('🔄 Обновить', 'expense_refresh')]);
+        
+        const keyboard = Markup.inlineKeyboard(groupButtons);
+        
+        // Сохраняем данные в сессию для фильтрации
+        sessions[userId].todayExpenseData = {
+            groupedExpense,
+            expenseByProduct,
+            warehouseGroups,
+            year,
+            date: today,
+            formattedDate
+        };
+        saveSessions();
+        
+        msg += `${'═'.repeat(25)}\n`;
+        msg += `📊 Выберите группу складов для детального просмотра:`;
+        
+        ctx.reply(msg, { parse_mode: 'Markdown', ...keyboard });
+        
+    } catch (e) {
+        console.error('Ошибка:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Обработка выбора группы складов для расхода за день
+bot.action(/^expense_group_(.+)$/, async (ctx) => {
+    const userId = ctx.from.id;
+    const session = getSession(userId);
+    
+    if (!session.todayExpenseData) {
+        return ctx.answerCbQuery('❌ Данные устарели, обновите отчет');
+    }
+    
+    const groupBase64 = ctx.match[1];
+    const selectedGroup = Buffer.from(groupBase64, 'base64').toString('utf-8');
+    
+    await ctx.answerCbQuery(`📁 ${selectedGroup}`);
+    
+    const { groupedExpense, year, formattedDate } = session.todayExpenseData;
+    
+    if (!groupedExpense[selectedGroup]) {
+        return ctx.reply('❌ Группа не найдена');
+    }
+    
+    let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate}\n`;
+    msg += `📁 Группа: *${selectedGroup}*\n`;
+    msg += `${'═'.repeat(25)}\n\n`;
+    
+    let groupTotal = 0;
+    
+    // Выводим по складам в группе
+    Object.entries(groupedExpense[selectedGroup]).sort().forEach(([warehouse, products]) => {
+        msg += `🏪 *${warehouse}*\n`;
+        msg += `${'─'.repeat(20)}\n`;
+        
+        let warehouseTotal = 0;
+        
+        Object.entries(products).sort().forEach(([product, tons]) => {
+            if (tons > 0.01) {
+                msg += `${product}\t${formatNumber(tons)} т/н (${year})\n`;
+                warehouseTotal += tons;
+            }
+        });
+        
+        msg += `_Итого: ${formatNumber(warehouseTotal)} т_\n\n`;
+        groupTotal += warehouseTotal;
+    });
+    
+    msg += `${'═'.repeat(25)}\n`;
+    msg += `📊 *Итого ${selectedGroup}: ${formatNumber(groupTotal)} т*`;
+    
+    // Кнопка "Назад"
+    const backButton = Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Назад к общему списку', 'expense_back')]
+    ]);
+    
+    ctx.reply(msg, { parse_mode: 'Markdown', ...backButton });
+});
+
+// Обработка кнопки "Назад" и "Обновить"
+bot.action('expense_back', async (ctx) => {
+    await ctx.answerCbQuery('🔄');
+    // Повторно вызываем главный обработчик
+    ctx.message = { text: '📤 Расход за день' };
+    return bot.handleUpdate({ message: ctx.message, from: ctx.from, chat: ctx.chat });
+});
+
+bot.action('expense_refresh', async (ctx) => {
+    await ctx.answerCbQuery('🔄 Обновление...');
+    // Повторно вызываем главный обработчик
+    ctx.message = { text: '📤 Расход за день' };
+    return bot.handleUpdate({ message: ctx.message, from: ctx.from, chat: ctx.chat });
 });
 
 // Запуск бота
