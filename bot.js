@@ -15,15 +15,6 @@ const path = require('path');
 const botFixes = require('./fix-telegram-bot-all');
 console.log('🔧 Исправления Telegram Bot загружены');
 
-// 📢 Загружаем модуль уведомлений о клиентах
-const clientNotifications = require('./client-notifications');
-console.log('📢 Модуль уведомлений о клиентах загружен');
-
-// 🔔 Настройки автоматических уведомлений
-const NOTIFICATION_TIME = '09:00'; // Время отправки уведомлений (09:00)
-const NOTIFICATION_DAYS = [7, 14]; // Дни для проверки (7 и 14 дней назад)
-let notificationInterval = null;
-
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const FIREBASE_URL = process.env.FIREBASE_DATABASE_URL;
 const DEFAULT_YEAR = '2026';
@@ -233,48 +224,6 @@ const getData = () => new Promise(async (resolve, reject) => {
     }).on('error', reject);
 });
 
-// Функция экранирования специальных символов Markdown (только в пользовательском контенте)
-const escapeMarkdown = (text) => {
-    if (!text) return '';
-    return text.toString()
-        .replace(/\\/g, '\\\\')  // Сначала экранируем обратные слеши
-        .replace(/\*/g, '\\*')   // Звездочки
-        .replace(/_/g, '\\_')    // Подчеркивания
-        .replace(/\[/g, '\\[')   // Квадратные скобки
-        .replace(/\]/g, '\\]')
-        .replace(/\(/g, '\\(')   // Круглые скобки
-        .replace(/\)/g, '\\)')
-        .replace(/~/g, '\\~')    // Тильда
-        .replace(/`/g, '\\`')    // Обратные кавычки
-        .replace(/>/g, '\\>')    // Больше
-        .replace(/#/g, '\\#')    // Решетка
-        .replace(/\+/g, '\\+')   // Плюс
-        .replace(/-/g, '\\-')    // Минус
-        .replace(/=/g, '\\=')    // Равно
-        .replace(/\|/g, '\\|')   // Вертикальная черта
-        .replace(/\{/g, '\\{')   // Фигурные скобки
-        .replace(/\}/g, '\\}')
-        .replace(/\./g, '\\.')   // Точка
-        .replace(/!/g, '\\!');   // Восклицательный знак
-};
-
-// Безопасная отправка сообщения с Markdown
-const sendMarkdownMessage = async (ctx, message) => {
-    try {
-        await ctx.reply(message, { parse_mode: 'Markdown' });
-    } catch (error) {
-        console.log('⚠️ Ошибка парсинга Markdown:', error.message);
-        console.log('📤 Отправляем как обычный текст');
-        // Убираем все Markdown форматирование и отправляем как обычный текст
-        const plainText = message
-            .replace(/\*([^*]+)\*/g, '$1')  // Убираем жирный текст
-            .replace(/_([^_]+)_/g, '$1')    // Убираем курсив
-            .replace(/`([^`]+)`/g, '$1')    // Убираем моноширинный текст
-            .replace(/\\(.)/g, '$1');       // Убираем экранирование
-        await ctx.reply(plainText);
-    }
-};
-
 // Форматирование чисел (используем безопасную версию)
 const formatNumber = (num) => {
     // 🔧 Используем безопасную функцию из модуля исправлений
@@ -393,6 +342,40 @@ const calculateFactBalance = (data, year) => {
         warehouseGroups,
         productTotals
     };
+};
+
+// Расчёт расхода товаров за сегодня
+const calculateTodayExpense = (data, year) => {
+    const yearData = data?.years?.[year];
+    if (!yearData || !yearData.expense) return null;
+
+    // Получаем сегодняшнюю дату в формате YYYY-MM-DD
+    const today = new Date().toISOString().split('T')[0];
+    
+    // Фильтруем расходы только за сегодня
+    const todayExpense = (yearData.expense || [])
+        .filter(item => !item.isDeleted && item.date === today);
+
+    if (todayExpense.length === 0) {
+        return null;
+    }
+
+    // Группируем расходы только по товарам (БЕЗ складов и фирм)
+    const expenseByProduct = {};
+
+    todayExpense.forEach(item => {
+        const product = item.product;
+        
+        if (!expenseByProduct[product]) {
+            expenseByProduct[product] = 0;
+        }
+        
+        // Конвертируем в тонны (quantity / 20)
+        const tons = (parseFloat(item.quantity) || 0) / 20;
+        expenseByProduct[product] += tons;
+    });
+
+    return expenseByProduct;
 };
 
 // Расчёт итогов вагонов
@@ -601,8 +584,8 @@ const adminKeyboard = Markup.keyboard([
 const reportsKeyboard = Markup.keyboard([
     ['📈 Приход за период', '📉 Расход за период'],
     ['💵 Погашения за период', '👥 Топ должников'],
-    ['🚂 Итоги вагонов', '👤 Карточка клиента'],
-    ['🔔 Уведомления о долгах', '🔙 Назад']
+    ['🚂 Итоги вагонов', ' Карточка клиента'],
+    ['🔙 Назад']
 ]).resize();
 const managementKeyboard = Markup.keyboard([
     ['👥 Пользователи', '📦 Товары'],
@@ -1288,19 +1271,17 @@ bot.hears(/👤 Клиенты/i, async (ctx) => {
         let clientNames = [];
         if (Array.isArray(data.clients)) {
             data.clients.forEach(c => {
-                // Фильтруем удаленных клиентов
                 if (typeof c === 'string') {
                     clientNames.push(c);
-                } else if (c && c.name && !c.isDeleted) {
+                } else if (c && c.name) {
                     clientNames.push(c.name);
                 }
             });
         } else if (typeof data.clients === 'object') {
             Object.values(data.clients).forEach(c => {
-                // Фильтруем удаленных клиентов
                 if (typeof c === 'string') {
                     clientNames.push(c);
-                } else if (c && c.name && !c.isDeleted) {
+                } else if (c && c.name) {
                     clientNames.push(c.name);
                 }
             });
@@ -1314,10 +1295,15 @@ bot.hears(/👤 Клиенты/i, async (ctx) => {
         if (clientNames.length === 0) {
             msg += `_Список пуст_\n`;
         } else {
-            // Показываем всех клиентов (убираем лимит 50)
-            clientNames.forEach((client, i) => {
+            // Показываем первые 50 клиентов
+            const showClients = clientNames.slice(0, 50);
+            showClients.forEach((client, i) => {
                 msg += `${i + 1}. ${client}\n`;
             });
+            
+            if (clientNames.length > 50) {
+                msg += `\n_...и ещё ${clientNames.length - 50} клиентов_\n`;
+            }
         }
         
         msg += `\n${'═'.repeat(25)}\n`;
@@ -2666,47 +2652,17 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
     
     await ctx.reply('⏳ Загрузка итогов вагонов...');
     try {
-        console.log(`🚂 Запрос итогов вагонов для пользователя ${userId}, год ${year}`);
-        
         const rawData = await getData();
-        if (!rawData) {
-            console.log('❌ rawData is null');
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        console.log('📡 Данные получены, ключи:', Object.keys(rawData));
+        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
         
         // Фильтруем данные по группам складов пользователя
         const data = filterDataByWarehouseGroup(rawData, userId);
-        console.log('🔍 Данные отфильтрованы');
-        
-        if (!data.years || !data.years[year]) {
-            console.log(`❌ Нет данных за год ${year}`);
-            return ctx.reply(`🚂 Нет данных за ${year} год`);
-        }
-        
-        if (!data.years[year].income) {
-            console.log(`❌ Нет данных о приходе за год ${year}`);
-            return ctx.reply(`🚂 Нет данных о приходе за ${year} год`);
-        }
-        
-        console.log(`📦 Записей прихода за ${year}: ${data.years[year].income.length}`);
-        const activeIncome = data.years[year].income.filter(item => !item.isDeleted);
-        console.log(`📦 Активных записей прихода: ${activeIncome.length}`);
         
         const wagonTotals = calculateWagonTotals(data, year);
         
-        if (!wagonTotals) {
-            console.log('❌ calculateWagonTotals returned null');
-            return ctx.reply(`🚂 Ошибка расчета итогов вагонов за ${year} год`);
-        }
-        
-        if (wagonTotals.items.length === 0) {
-            console.log('❌ wagonTotals.items is empty');
+        if (!wagonTotals || wagonTotals.items.length === 0) {
             return ctx.reply(`🚂 Нет данных о вагонах за ${year} год`);
         }
-        
-        console.log(`✅ Найдено позиций: ${wagonTotals.items.length}`);
 
         let msg = `🚂 *ИТОГИ ВАГОНОВ*\n📅 ${year}\n${'═'.repeat(25)}\n\n`;
         
@@ -2720,13 +2676,13 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
         });
         
         Object.entries(byWarehouse).sort().forEach(([warehouse, items]) => {
-            msg += `🏪 *${escapeMarkdown(warehouse)}*\n`;
+            msg += `🏪 *${warehouse}*\n`;
             msg += `${'─'.repeat(20)}\n`;
             
             let whWagons = 0, whDoc = 0, whFact = 0, whTons = 0;
             
             items.forEach(item => {
-                msg += `📦 ${escapeMarkdown(item.product)} (${escapeMarkdown(item.company)})\n`;
+                msg += `📦 ${item.product} (${item.company})\n`;
                 msg += `   🚂 Вагонов: ${item.wagons}\n`;
                 msg += `   📄 По док: ${item.qtyDoc} шт\n`;
                 msg += `   ✅ Факт: ${item.qtyFact} шт\n`;
@@ -2741,7 +2697,7 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
                 whTons += item.weightTons;
             });
             
-            msg += `📊 *Итого ${escapeMarkdown(warehouse)}:*\n`;
+            msg += `📊 *Итого ${warehouse}:*\n`;
             msg += `   🚂 ${whWagons} вагонов, ⚖️ ${formatNumber(whTons)} т\n\n`;
         });
         
@@ -2753,20 +2709,17 @@ bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
         msg += `   Разница: *${wagonTotals.totals.difference}* шт\n`;
         msg += `   Вес: *${formatNumber(wagonTotals.totals.weightTons)} тонн*`;
         
-        console.log(`📤 Отправляем сообщение длиной ${msg.length} символов`);
-        
         if (msg.length > 4000) {
             const parts = msg.match(/[\s\S]{1,4000}/g);
             for (const part of parts) {
-                await sendMarkdownMessage(ctx, part);
+                await ctx.reply(part, { parse_mode: 'Markdown' });
             }
         } else {
-            await sendMarkdownMessage(ctx, msg);
+            ctx.reply(msg, { parse_mode: 'Markdown' });
         }
     } catch (e) {
-        console.error('❌ Ошибка в итогах вагонов:', e);
-        console.error('Stack trace:', e.stack);
-        ctx.reply(`❌ Ошибка загрузки данных: ${e.message}`);
+        console.error('Ошибка:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
     }
 });
 
@@ -3273,10 +3226,9 @@ bot.hears(/👤|карточка клиента/i, async (ctx) => {
         // Если clients - массив
         if (Array.isArray(data.clients)) {
             data.clients.forEach(c => {
-                // Фильтруем удаленных клиентов
                 if (typeof c === 'string') {
                     clientNames.push(c);
-                } else if (c && c.name && !c.isDeleted) {
+                } else if (c && c.name) {
                     clientNames.push(c.name);
                 }
             });
@@ -3284,16 +3236,15 @@ bot.hears(/👤|карточка клиента/i, async (ctx) => {
         // Если clients - объект
         else if (data.clients && typeof data.clients === 'object') {
             Object.values(data.clients).forEach(c => {
-                // Фильтруем удаленных клиентов
                 if (typeof c === 'string') {
                     clientNames.push(c);
-                } else if (c && c.name && !c.isDeleted) {
+                } else if (c && c.name) {
                     clientNames.push(c.name);
                 }
             });
         }
         
-        // Также собираем клиентов из расходов (только неудаленные записи)
+        // Также собираем клиентов из расходов
         const yearData = data?.years?.[year];
         if (yearData && yearData.expense) {
             yearData.expense.filter(e => !e.isDeleted).forEach(e => {
@@ -3314,8 +3265,8 @@ bot.hears(/👤|карточка клиента/i, async (ctx) => {
         sessions[userId].clientsList = clientNames;
         saveSessions();
         
-        // Создаём inline кнопки для всех клиентов (убираем лимит 50)
-        const buttons = clientNames.map((client, index) => {
+        // Создаём inline кнопки для клиентов (максимум 50)
+        const buttons = clientNames.slice(0, 50).map((client, index) => {
             const shortName = client.length > 25 ? client.substring(0, 22) + '...' : client;
             return [Markup.button.callback(`👤 ${shortName}`, `cl_${index}`)];
         });
@@ -3535,8 +3486,8 @@ function calculateClientCard(data, year, clientName) {
     let totalSum = 0;
     let totalPaid = 0;
     
-    // Собираем покупки (только неудаленные записи)
-    (yearData.expense || []).filter(e => !e.isDeleted).forEach(e => {
+    // Собираем покупки
+    (yearData.expense || []).forEach(e => {
         if (e.client === clientName) {
             const tons = (e.quantity || 0) / 20;
             purchases.push({
@@ -3553,8 +3504,8 @@ function calculateClientCard(data, year, clientName) {
         }
     });
     
-    // Собираем платежи (только неудаленные записи)
-    (yearData.payments || []).filter(p => !p.isDeleted).forEach(p => {
+    // Собираем платежи
+    (yearData.payments || []).forEach(p => {
         if (p.client === clientName) {
             payments.push({
                 date: p.date || '',
@@ -3578,210 +3529,6 @@ function calculateClientCard(data, year, clientName) {
         payments
     };
 }
-
-// 🔔 Уведомления о долгах - клиенты, которые покупали N дней назад
-bot.hears(/🔔|уведомления о долгах/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    // Показываем кнопки выбора количества дней
-    const daysButtons = Markup.inlineKeyboard([
-        [Markup.button.callback('📅 7 дней назад', 'notify_7')],
-        [Markup.button.callback('📅 14 дней назад', 'notify_14')],
-        [Markup.button.callback('📅 30 дней назад', 'notify_30')]
-    ]);
-    
-    ctx.reply(
-        `🔔 *УВЕДОМЛЕНИЯ О ДОЛГАХ*\n📅 Год: *${year}*\n\nВыберите период:\n_Показать клиентов с долгами, которые покупали:_`,
-        { parse_mode: 'Markdown', ...daysButtons }
-    );
-});
-
-// Обработка выбора периода для уведомлений
-bot.action(/^notify_(\d+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const daysAgo = parseInt(ctx.match[1]);
-    
-    await ctx.answerCbQuery('⏳ Поиск должников...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const debtorsWithPurchases = clientNotifications.findDebtorsWithPurchaseOnDate(data, year, daysAgo);
-        
-        if (debtorsWithPurchases.length === 0) {
-            return ctx.reply(`✅ Нет должников, которые покупали ${daysAgo} дней назад`);
-        }
-        
-        // Формируем дату покупки
-        const targetDate = new Date();
-        targetDate.setDate(targetDate.getDate() - daysAgo);
-        const formattedDate = targetDate.toLocaleDateString('ru-RU');
-        
-        let msg = `🔔 *УВЕДОМЛЕНИЯ О ДОЛГАХ*\n`;
-        msg += `📅 Клиенты, которые покупали ${formattedDate} (${daysAgo} дней назад)\n`;
-        msg += `${'═'.repeat(30)}\n\n`;
-        
-        let totalDebt = 0;
-        let totalNotificationAmount = 0;
-        
-        debtorsWithPurchases.forEach((debtor, i) => {
-            msg += `${i + 1}. 👤 *${debtor.client}*\n`;
-            msg += `   💳 Общий долг: *${clientNotifications.formatNumber(debtor.debt)} $*\n`;
-            
-            // Показываем покупки за указанную дату
-            msg += `   📦 Покупки ${formattedDate}:\n`;
-            debtor.purchases.forEach(purchase => {
-                msg += `      • ${purchase.product} - ${purchase.quantity} шт (${clientNotifications.formatNumber(purchase.total)} $)\n`;
-            });
-            msg += `   💰 Сумма покупок в тот день: *${clientNotifications.formatNumber(debtor.totalPurchaseAmount)} $*\n\n`;
-            
-            totalDebt += debtor.debt;
-            totalNotificationAmount += debtor.totalPurchaseAmount;
-        });
-        
-        msg += `${'═'.repeat(30)}\n`;
-        msg += `📊 *ИТОГО:*\n`;
-        msg += `   👥 Должников: *${debtorsWithPurchases.length}*\n`;
-        msg += `   💳 Общий долг: *${clientNotifications.formatNumber(totalDebt)} $*\n`;
-        msg += `   💰 Сумма покупок ${formattedDate}: *${clientNotifications.formatNumber(totalNotificationAmount)} $*\n\n`;
-        msg += `⚠️ _Рекомендуется связаться с этими клиентами для напоминания о долге_`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastDebtNotifications = { 
-            debtorsWithPurchases, 
-            daysAgo, 
-            formattedDate, 
-            year,
-            totalDebt,
-            totalNotificationAmount
-        };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `exnotify_${daysAgo}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
-    } catch (e) {
-        console.error('Ошибка уведомлений:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт уведомлений о долгах в Excel
-bot.action(/^exnotify_(\d+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastDebtNotifications) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { debtorsWithPurchases, daysAgo, formattedDate, year, totalDebt, totalNotificationAmount } = session.lastDebtNotifications;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Уведомления о долгах');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Клиент', key: 'client', width: 25 },
-            { header: 'Общий долг ($)', key: 'totalDebt', width: 15 },
-            { header: 'Покупки в тот день ($)', key: 'dayPurchases', width: 20 },
-            { header: 'Товары', key: 'products', width: 30 },
-            { header: 'Склады', key: 'warehouses', width: 20 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFFF9800' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        
-        // Данные
-        debtorsWithPurchases.forEach((debtor, i) => {
-            const products = debtor.purchases.map(p => `${p.product} (${p.quantity} шт)`).join(', ');
-            const warehouses = [...new Set(debtor.purchases.map(p => p.warehouse))].join(', ');
-            
-            const row = sheet.addRow({
-                num: i + 1,
-                client: debtor.client,
-                totalDebt: debtor.debt,
-                dayPurchases: debtor.totalPurchaseAmount,
-                products: products,
-                warehouses: warehouses
-            });
-            
-            // Подсветка больших долгов
-            if (debtor.debt > 5000) {
-                row.getCell('totalDebt').fill = {
-                    type: 'pattern',
-                    pattern: 'solid',
-                    fgColor: { argb: 'FFFFCDD2' }
-                };
-            }
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            client: 'ИТОГО:',
-            totalDebt: totalDebt,
-            dayPurchases: totalNotificationAmount,
-            products: '',
-            warehouses: ''
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Форматирование числовых колонок
-        sheet.getColumn('totalDebt').numFmt = '#,##0.00';
-        sheet.getColumn('dayPurchases').numFmt = '#,##0.00';
-        
-        // Сохраняем файл
-        const fileName = `Уведомления_о_долгах_${daysAgo}_дней_${year}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: fileName },
-            { 
-                caption: `🔔 Уведомления о долгах\n📅 Покупки ${formattedDate} (${daysAgo} дней назад)\n👥 ${debtorsWithPurchases.length} должников\n💳 Общий долг: ${clientNotifications.formatNumber(totalDebt)} $` 
-            }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
-});
 
 // Остатки складов
 bot.hears(/📦|\/stock|остатки складов/i, async (ctx) => {
@@ -3892,6 +3639,21 @@ bot.hears(/🏭|фактический остаток/i, async (ctx) => {
             Object.entries(factBalance.productTotals).sort().forEach(([product, tons]) => {
                 if (tons !== 0) {
                     msg += `  • ${product}: ${formatNumber(tons)} т\n`;
+                }
+            });
+        }
+        
+        // Добавляем раздел "Расход товаров" за сегодня
+        const todayExpense = calculateTodayExpense(data, year);
+        if (todayExpense && Object.keys(todayExpense).length > 0) {
+            msg += `\n${'═'.repeat(25)}\n`;
+            msg += `📤 *РАСХОД ТОВАРОВ*\n`;
+            msg += `📅 ${new Date().toLocaleDateString('ru-RU')}\n`;
+            msg += `${'─'.repeat(20)}\n`;
+            
+            Object.entries(todayExpense).sort().forEach(([product, tons]) => {
+                if (tons > 0.01) {
+                    msg += `  • ${product}: ${formatNumber(tons)} т/н (${year})\n`;
                 }
             });
         }
