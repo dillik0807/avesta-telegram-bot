@@ -4524,18 +4524,11 @@ bot.hears(/📤|расход за день/i, async (ctx) => {
             msg += `\n`;
         }
         
-        // Создаем inline кнопки для фильтрации по группам
-        const groupButtons = [];
-        const groups = Object.keys(groupedExpense).sort();
-        
-        // Добавляем кнопку "Общий отчет"
-        groupButtons.push([Markup.button.callback('📊 Общий отчет', 'expense_total')]);
-        
-        groups.forEach(group => {
-            groupButtons.push([Markup.button.callback(`📁 ${group}`, `expense_group_${Buffer.from(group).toString('base64')}`)]);
-        });
-        
-        groupButtons.push([Markup.button.callback('🔄 Обновить', 'expense_refresh')]);
+        // Создаем inline кнопки - только "Общий отчет" и "Обновить"
+        const groupButtons = [
+            [Markup.button.callback('📊 Общий отчет', 'expense_total')],
+            [Markup.button.callback('� Обновить', 'expense_refresh')]
+        ];
         
         const keyboard = Markup.inlineKeyboard(groupButtons);
         
