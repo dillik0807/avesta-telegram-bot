@@ -4475,27 +4475,52 @@ bot.hears(/📤|расход за день/i, async (ctx) => {
             groupedExpense[group][warehouse] = products;
         });
         
-        // Формируем сообщение
+        // Формируем сообщение - показываем расход по группам
         const formattedDate = new Date().toLocaleDateString('ru-RU');
         let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate}\n${'═'.repeat(25)}\n\n`;
         
         let grandTotal = 0;
         
-        // Выводим общий список по товарам
-        msg += `📦 *ОБЩИЙ РАСХОД:*\n`;
-        msg += `${'─'.repeat(20)}\n`;
-        Object.entries(expenseByProduct).sort().forEach(([product, tons]) => {
-            if (tons > 0.01) {
-                msg += `${product}\t${formatNumber(tons)} т/н (${year})\n`;
-                grandTotal += tons;
-            }
+        // Выводим расход по группам складов
+        Object.entries(groupedExpense).sort().forEach(([group, warehouses]) => {
+            msg += `📁 *${group}*\n`;
+            msg += `${'─'.repeat(20)}\n`;
+            
+            let groupTotal = 0;
+            
+            // Собираем все товары по группе
+            const groupProducts = {};
+            Object.entries(warehouses).forEach(([warehouse, products]) => {
+                Object.entries(products).forEach(([product, tons]) => {
+                    const key = `${warehouse} ${product}`;
+                    if (!groupProducts[key]) {
+                        groupProducts[key] = 0;
+                    }
+                    groupProducts[key] += tons;
+                });
+            });
+            
+            // Выводим товары группы
+            Object.entries(groupProducts).sort().forEach(([productKey, tons]) => {
+                if (tons > 0.01) {
+                    msg += `${productKey}\t${formatNumber(tons)} т/н\n`;
+                    groupTotal += tons;
+                }
+            });
+            
+            msg += `\n`;
+            grandTotal += groupTotal;
         });
         
-        msg += `\n💰 *Всего: ${formatNumber(grandTotal)} т*\n\n`;
+        msg += `${'═'.repeat(25)}\n`;
+        msg += `💰 *Всего: ${formatNumber(grandTotal)} т*\n\n`;
         
         // Создаем inline кнопки для фильтрации по группам
         const groupButtons = [];
         const groups = Object.keys(groupedExpense).sort();
+        
+        // Добавляем кнопку "Общий отчет"
+        groupButtons.push([Markup.button.callback('📊 Общий отчет', 'expense_total')]);
         
         groups.forEach(group => {
             groupButtons.push([Markup.button.callback(`📁 ${group}`, `expense_group_${Buffer.from(group).toString('base64')}`)]);
@@ -4517,7 +4542,7 @@ bot.hears(/📤|расход за день/i, async (ctx) => {
         saveSessions();
         
         msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 Выберите группу складов для детального просмотра:`;
+        msg += `📊 Выберите отчет:`;
         
         ctx.reply(msg, { parse_mode: 'Markdown', ...keyboard });
         
@@ -4541,7 +4566,7 @@ bot.action(/^expense_group_(.+)$/, async (ctx) => {
     
     await ctx.answerCbQuery(`📁 ${selectedGroup}`);
     
-    const { groupedExpense, year, formattedDate } = session.todayExpenseData;
+    const { groupedExpense, formattedDate } = session.todayExpenseData;
     
     if (!groupedExpense[selectedGroup]) {
         return ctx.reply('❌ Группа не найдена');
@@ -4562,7 +4587,7 @@ bot.action(/^expense_group_(.+)$/, async (ctx) => {
         
         Object.entries(products).sort().forEach(([product, tons]) => {
             if (tons > 0.01) {
-                msg += `${product}\t${formatNumber(tons)} т/н (${year})\n`;
+                msg += `${product}\t${formatNumber(tons)} т/н\n`;
                 warehouseTotal += tons;
             }
         });
@@ -4577,6 +4602,44 @@ bot.action(/^expense_group_(.+)$/, async (ctx) => {
     // Кнопка "Назад"
     const backButton = Markup.inlineKeyboard([
         [Markup.button.callback('🔙 Назад к общему списку', 'expense_back')]
+    ]);
+    
+    ctx.reply(msg, { parse_mode: 'Markdown', ...backButton });
+});
+
+// Обработка кнопки "Общий отчет"
+bot.action('expense_total', async (ctx) => {
+    const userId = ctx.from.id;
+    const session = getSession(userId);
+    
+    if (!session.todayExpenseData) {
+        return ctx.answerCbQuery('❌ Данные устарели, обновите отчет');
+    }
+    
+    await ctx.answerCbQuery('📊 Общий отчет');
+    
+    const { expenseByProduct, formattedDate } = session.todayExpenseData;
+    
+    let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate}\n`;
+    msg += `📊 *ОБЩИЙ ОТЧЕТ*\n`;
+    msg += `${'═'.repeat(25)}\n\n`;
+    
+    let grandTotal = 0;
+    
+    // Выводим общий список по товарам
+    Object.entries(expenseByProduct).sort().forEach(([product, tons]) => {
+        if (tons > 0.01) {
+            msg += `${product}\t${formatNumber(tons)} т/н\n`;
+            grandTotal += tons;
+        }
+    });
+    
+    msg += `\n${'═'.repeat(25)}\n`;
+    msg += `💰 *Всего: ${formatNumber(grandTotal)} т*`;
+    
+    // Кнопка "Назад"
+    const backButton = Markup.inlineKeyboard([
+        [Markup.button.callback('🔙 Назад', 'expense_back')]
     ]);
     
     ctx.reply(msg, { parse_mode: 'Markdown', ...backButton });
