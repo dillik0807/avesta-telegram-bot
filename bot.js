@@ -4426,7 +4426,19 @@ bot.hears(/📤|расход за день/i, async (ctx) => {
             .filter(item => !item.isDeleted && item.date === today);
         
         if (todayExpense.length === 0) {
-            return ctx.reply(`📤 Сегодня расходов не было\n📅 ${new Date().toLocaleDateString('ru-RU')}`);
+            const formattedDate = new Date().toLocaleDateString('ru-RU');
+            const noDataMsg = `📤 Сегодня расходов не было\n📅 ${formattedDate}`;
+            
+            // Добавляем inline кнопки даже если нет данных
+            const groupButtons = [
+                [
+                    Markup.button.callback('📅 Вчера', 'expense_yesterday'),
+                    Markup.button.callback('📅 Позавчера', 'expense_2days')
+                ]
+            ];
+            
+            const keyboard = Markup.inlineKeyboard(groupButtons);
+            return ctx.reply(noDataMsg, keyboard);
         }
         
         // Группируем по складам и товарам
