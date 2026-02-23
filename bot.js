@@ -4527,7 +4527,11 @@ bot.hears(/📤|расход за день/i, async (ctx) => {
         // Создаем inline кнопки - только "Общий отчет" и "Обновить"
         const groupButtons = [
             [Markup.button.callback('📊 Общий отчет', 'expense_total')],
-            [Markup.button.callback('� Обновить', 'expense_refresh')]
+            [
+                Markup.button.callback('📅 Вчера', 'expense_yesterday'),
+                Markup.button.callback('📅 Позавчера', 'expense_2days')
+            ],
+            [Markup.button.callback('🔄 Обновить', 'expense_refresh')]
         ];
         
         const keyboard = Markup.inlineKeyboard(groupButtons);
@@ -4651,6 +4655,194 @@ bot.action('expense_refresh', async (ctx) => {
     ctx.message = { text: '📤 Расход за день' };
     return bot.handleUpdate({ message: ctx.message, from: ctx.from, chat: ctx.chat });
 });
+
+// Обработка кнопки "Вчера"
+bot.action('expense_yesterday', async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    
+    await ctx.answerCbQuery('� Загрузка данных за вчера...');
+    
+    try {
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        
+        const yearData = data?.years?.[year];
+        if (!yearData || !yearData.expense) {
+            return ctx.reply(`📤 Нет данных о расходе за ${year} год`);
+        }
+        
+        // Получаем вчерашнюю дату
+        const yesterday = new Date();
+        yesterday.setDate(yesterday.getDate() - 1);
+        const targetDate = yesterday.toISOString().split('T')[0];
+        const formattedDate = yesterday.toLocaleDateString('ru-RU');
+        
+        // Фильтруем расходы за вчера
+        const expense = (yearData.expense || [])
+            .filter(item => !item.isDeleted && item.date === targetDate);
+        
+        if (expense.length === 0) {
+            return ctx.reply(`📤 Вчера расходов не было\n📅 ${formattedDate}`);
+        }
+        
+        // Используем ту же логику группировки
+        const result = generateExpenseReport(data, expense, year, formattedDate, 'Вчера');
+        
+        const backButton = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Назад', 'expense_back')]
+        ]);
+        
+        ctx.reply(result, { parse_mode: 'Markdown', ...backButton });
+        
+    } catch (e) {
+        console.error('Ошибка:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Обработка кнопки "Позавчера"
+bot.action('expense_2days', async (ctx) => {
+    const userId = ctx.from.id;
+    const year = getUserYear(userId);
+    
+    await ctx.answerCbQuery('📅 Загрузка данных за позавчера...');
+    
+    try {
+        const data = await getData();
+        if (!data) return ctx.reply('❌ Не удалось получить данные');
+        
+        const yearData = data?.years?.[year];
+        if (!yearData || !yearData.expense) {
+            return ctx.reply(`📤 Нет данных о расходе за ${year} год`);
+        }
+        
+        // Получаем позавчерашнюю дату
+        const twoDaysAgo = new Date();
+        twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
+        const targetDate = twoDaysAgo.toISOString().split('T')[0];
+        const formattedDate = twoDaysAgo.toLocaleDateString('ru-RU');
+        
+        // Фильтруем расходы за позавчера
+        const expense = (yearData.expense || [])
+            .filter(item => !item.isDeleted && item.date === targetDate);
+        
+        if (expense.length === 0) {
+            return ctx.reply(`📤 Позавчера расходов не было\n📅 ${formattedDate}`);
+        }
+        
+        // Используем ту же логику группировки
+        const result = generateExpenseReport(data, expense, year, formattedDate, 'Позавчера');
+        
+        const backButton = Markup.inlineKeyboard([
+            [Markup.button.callback('🔙 Назад', 'expense_back')]
+        ]);
+        
+        ctx.reply(result, { parse_mode: 'Markdown', ...backButton });
+        
+    } catch (e) {
+        console.error('Ошибка:', e);
+        ctx.reply('❌ Ошибка загрузки данных');
+    }
+});
+
+// Функция для генерации отчета о расходе (используется для всех дат)
+function generateExpenseReport(data, expenseData, year, formattedDate, dateLabel) {
+    // Группируем по складам и товарам
+    const expenseByWarehouse = {};
+    const expenseByProduct = {};
+    
+    expenseData.forEach(item => {
+        const warehouse = item.warehouse || 'Без склада';
+        const product = item.product || 'Без товара';
+        const tons = (parseFloat(item.quantity) || 0) / 20;
+        
+        // По складам
+        if (!expenseByWarehouse[warehouse]) {
+            expenseByWarehouse[warehouse] = {};
+        }
+        if (!expenseByWarehouse[warehouse][product]) {
+            expenseByWarehouse[warehouse][product] = 0;
+        }
+        expenseByWarehouse[warehouse][product] += tons;
+        
+        // По товарам (общий)
+        if (!expenseByProduct[product]) {
+            expenseByProduct[product] = 0;
+        }
+        expenseByProduct[product] += tons;
+    });
+    
+    // Получаем группы складов
+    const warehouseGroups = {};
+    (data.warehouses || []).forEach(w => {
+        if (w.name && w.group) {
+            warehouseGroups[w.name] = w.group;
+        }
+    });
+    
+    // Группируем по группам складов и товарам (без складов в названии)
+    const groupedExpense = {};
+    Object.entries(expenseByWarehouse).forEach(([warehouse, products]) => {
+        const group = warehouseGroups[warehouse] || 'Без группы';
+        if (!groupedExpense[group]) {
+            groupedExpense[group] = {};
+        }
+        
+        // Суммируем товары по группе (без привязки к складу)
+        Object.entries(products).forEach(([product, tons]) => {
+            if (!groupedExpense[group][product]) {
+                groupedExpense[group][product] = 0;
+            }
+            groupedExpense[group][product] += tons;
+        });
+    });
+    
+    // Формируем сообщение
+    let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate} (${dateLabel})\n${'═'.repeat(25)}\n\n`;
+    
+    let grandTotal = 0;
+    const totalByProduct = {}; // Для итогов по товарам
+    
+    // Выводим расход по группам складов
+    Object.entries(groupedExpense).sort().forEach(([group, products]) => {
+        msg += `📁 *${group}*\n`;
+        msg += `${'─'.repeat(20)}\n`;
+        
+        let groupTotal = 0;
+        
+        // Выводим товары группы
+        Object.entries(products).sort().forEach(([product, tons]) => {
+            if (tons > 0.01) {
+                msg += `${product}\t${formatNumber(tons)} т/н\n`;
+                groupTotal += tons;
+                
+                // Суммируем для общих итогов по товарам
+                if (!totalByProduct[product]) {
+                    totalByProduct[product] = 0;
+                }
+                totalByProduct[product] += tons;
+            }
+        });
+        
+        msg += `\n`;
+        grandTotal += groupTotal;
+    });
+    
+    msg += `${'═'.repeat(25)}\n`;
+    msg += `💰 *Всего: ${formatNumber(grandTotal)} т*\n\n`;
+    
+    // Добавляем итоги по товарам
+    if (Object.keys(totalByProduct).length > 0) {
+        msg += `📦 *ИТОГО ПО ТОВАРАМ:*\n`;
+        msg += `${'─'.repeat(20)}\n`;
+        Object.entries(totalByProduct).sort().forEach(([product, tons]) => {
+            msg += `${product}\t${formatNumber(tons)} т/н\n`;
+        });
+    }
+    
+    return msg;
+}
 
 // Запуск бота
 console.log('🔄 Подключение к Telegram API...');
