@@ -1,4888 +1,1457 @@
-/**
- * 🤖 Telegram бот для системы учёта товаров Avesta
- * С авторизацией пользователей и поддержкой Firebase Admin SDK
- */
+﻿require('dotenv').config();
+const { Telegraf, Scenes, session } = require('telegraf');
+const database = require('./database');
+const whatsapp = require('./whatsapp');
+const admin = require('./admin');
+const dataManager = require('./data-manager');
 
-require('dotenv').config();
-const { Telegraf, Markup } = require('telegraf');
-const https = require('https');
-const crypto = require('crypto');
-const fs = require('fs');
-const ExcelJS = require('exceljs');
-const path = require('path');
-
-// 🔧 Загружаем все исправления
-const botFixes = require('./fix-telegram-bot-all');
-console.log('🔧 Исправления Telegram Bot загружены');
-
-// 📢 Загружаем модуль уведомлений о клиентах
-const clientNotifications = require('./client-notifications');
-console.log('📢 Модуль уведомлений о клиентах загружен');
-
-// 🔔 Настройки автоматических уведомлений
-const NOTIFICATION_TIME = '09:00'; // Время отправки уведомлений (09:00)
-const NOTIFICATION_DAYS = [7, 14]; // Дни для проверки (7 и 14 дней назад)
-let notificationInterval = null;
-
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const FIREBASE_URL = process.env.FIREBASE_DATABASE_URL;
-const DEFAULT_YEAR = '2026';
-const SESSIONS_FILE = './sessions.json';
-const SERVICE_ACCOUNT_FILE = './firebase-service-account.json';
-
-if (!BOT_TOKEN) {
-    console.error('❌ TELEGRAM_BOT_TOKEN не указан!');
-    process.exit(1);
-}
-
-// Инициализация Firebase Admin SDK
-let firebaseAdmin = null;
-let firebaseDb = null;
-
-// Попробуем инициализировать из переменной окружения (для Railway)
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+// 🔧 Автоматическая миграция PostgreSQL при запуске
+async function autoMigrate() {
+  if (process.env.DATABASE_URL) {
+    console.log('🔄 Проверка необходимости миграции PostgreSQL...');
     try {
-        const admin = require('firebase-admin');
-        const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount),
-            databaseURL: FIREBASE_URL
-        });
-        firebaseDb = admin.database();
-        firebaseAdmin = admin;
-        console.log('✅ Firebase Admin SDK инициализирован (из ENV)');
-    } catch (e) {
-        console.log('⚠️ Ошибка инициализации Firebase из ENV:', e.message);
-    }
-}
-// Иначе пробуем из файла (для локальной разработки)
-else if (fs.existsSync(SERVICE_ACCOUNT_FILE)) {
-    try {
-        const admin = require('firebase-admin');
-        const serviceAccount = require(SERVICE_ACCOUNT_FILE);
-        admin.initializeApp({
-            credential: admin.credential.cert(serviceAccount),
-            databaseURL: FIREBASE_URL
-        });
-        firebaseDb = admin.database();
-        firebaseAdmin = admin;
-        console.log('✅ Firebase Admin SDK инициализирован (из файла)');
-    } catch (e) {
-        console.log('⚠️ Не удалось инициализировать Firebase Admin:', e.message);
-    }
-}
-
-const bot = new Telegraf(BOT_TOKEN);
-console.log('🤖 Бот запускается...');
-
-// Сессии авторизованных пользователей (в памяти для Railway)
-let sessions = {};
-try {
-    if (fs.existsSync(SESSIONS_FILE)) {
-        sessions = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf8'));
-    }
-} catch (e) { sessions = {}; }
-
-const saveSessions = () => {
-    try { fs.writeFileSync(SESSIONS_FILE, JSON.stringify(sessions, null, 2)); } catch (e) {}
-};
-
-// Хеширование пароля (как в приложении - чистый SHA-256 без соли)
-const hashPassword = (password) => {
-    return crypto.createHash('sha256').update(password).digest('hex');
-};
-
-// Проверка авторизации
-const isAuthorized = (userId) => sessions[userId] && sessions[userId].authorized;
-const getSession = (userId) => sessions[userId] || {};
-const getUserYear = (userId) => getSession(userId).year || DEFAULT_YEAR;
-const getUserWarehouseGroups = (userId) => getSession(userId).warehouseGroup || [];
-const setUserYear = (userId, year) => {
-    if (sessions[userId]) {
-        sessions[userId].year = year;
-        saveSessions();
-    }
-};
-
-// Проверка доступа к складу по группе
-const canAccessWarehouse = (userId, warehouseName, warehouseGroups) => {
-    const session = getSession(userId);
-    // Админ видит всё
-    if (session.role === 'admin') return true;
-    // Если у пользователя нет ограничений по группам - видит всё
-    const userGroups = session.warehouseGroup || [];
-    if (!userGroups || userGroups.length === 0 || !userGroups[0]) return true;
-    // Проверяем группу склада
-    const whGroup = warehouseGroups[warehouseName];
-    if (!whGroup) return true; // Если у склада нет группы - показываем
-    return userGroups.includes(whGroup);
-};
-
-// Фильтрация данных по группам складов пользователя
-const filterDataByWarehouseGroup = (data, userId) => {
-    const session = getSession(userId);
-    // Админ видит всё
-    if (session.role === 'admin') return data;
-    // Если у пользователя нет ограничений по группам - видит всё
-    const userGroups = session.warehouseGroup || [];
-    if (!userGroups || userGroups.length === 0 || !userGroups[0]) return data;
-    
-    // Получаем маппинг склад -> группа
-    const warehouseToGroup = {};
-    (data.warehouses || []).forEach(w => {
-        if (w.name && w.group) {
-            warehouseToGroup[w.name] = w.group;
-        }
-    });
-    
-    // Функция проверки доступа к складу
-    const hasAccess = (warehouseName) => {
-        const whGroup = warehouseToGroup[warehouseName];
-        if (!whGroup) return true; // Если у склада нет группы - показываем
-        return userGroups.includes(whGroup);
-    };
-    
-    // Фильтруем данные года
-    const filteredData = JSON.parse(JSON.stringify(data)); // Глубокая копия
-    
-    if (filteredData.years) {
-        Object.keys(filteredData.years).forEach(year => {
-            const yearData = filteredData.years[year];
-            
-            // Фильтруем приход
-            if (yearData.income) {
-                yearData.income = yearData.income.filter(item => hasAccess(item.warehouse));
-            }
-            
-            // Фильтруем расход
-            if (yearData.expense) {
-                yearData.expense = yearData.expense.filter(item => hasAccess(item.warehouse));
-            }
-        });
-    }
-    
-    // Фильтруем список складов
-    if (filteredData.warehouses) {
-        filteredData.warehouses = filteredData.warehouses.filter(w => {
-            if (!w.group) return true;
-            return userGroups.includes(w.group);
-        });
-    }
-    
-    return filteredData;
-};
-
-// Получение данных из Firebase
-const getData = () => new Promise(async (resolve, reject) => {
-    // Если есть Admin SDK - используем его
-    if (firebaseDb) {
-        try {
-            console.log('📡 Запрос данных из Firebase...');
-            const snapshot = await firebaseDb.ref('/').once('value');
-            const rawData = snapshot.val();
-            console.log('📦 Данные получены, ключи:', rawData ? Object.keys(rawData) : 'null');
-            
-            // Проверяем разные структуры данных
-            let data = rawData;
-            
-            // Если данные в retailAppData
-            if (rawData && rawData.retailAppData) {
-                console.log('📂 Используем retailAppData');
-                data = rawData.retailAppData;
-            }
-            
-            // Если данные в data
-            if (rawData && rawData.data) {
-                console.log('📂 Используем data');
-                data = rawData.data;
-            }
-            
-            if (data) {
-                console.log('📂 Ключи данных:', Object.keys(data));
-            }
-            
-            resolve(data);
-            return;
-        } catch (e) {
-            console.error('Firebase Admin ошибка:', e.message);
-        }
-    }
-    
-    // Иначе пробуем REST API
-    https.get(`${FIREBASE_URL}/.json`, (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-            try {
-                const parsed = JSON.parse(data);
-                if (parsed && parsed.error) {
-                    console.log('Firebase REST ошибка:', parsed.error);
-                    resolve(null);
-                } else {
-                    // Проверяем структуру
-                    if (parsed && parsed.retailAppData) {
-                        resolve(parsed.retailAppData);
-                    } else if (parsed && parsed.data) {
-                        resolve(parsed.data);
-                    } else {
-                        resolve(parsed);
-                    }
-                }
-            } catch (e) { reject(e); }
-        });
-    }).on('error', reject);
-});
-
-// Функция экранирования специальных символов Markdown (только в пользовательском контенте)
-const escapeMarkdown = (text) => {
-    if (!text) return '';
-    return text.toString()
-        .replace(/\\/g, '\\\\')  // Сначала экранируем обратные слеши
-        .replace(/\*/g, '\\*')   // Звездочки
-        .replace(/_/g, '\\_')    // Подчеркивания
-        .replace(/\[/g, '\\[')   // Квадратные скобки
-        .replace(/\]/g, '\\]')
-        .replace(/\(/g, '\\(')   // Круглые скобки
-        .replace(/\)/g, '\\)')
-        .replace(/~/g, '\\~')    // Тильда
-        .replace(/`/g, '\\`')    // Обратные кавычки
-        .replace(/>/g, '\\>')    // Больше
-        .replace(/#/g, '\\#')    // Решетка
-        .replace(/\+/g, '\\+')   // Плюс
-        .replace(/-/g, '\\-')    // Минус
-        .replace(/=/g, '\\=')    // Равно
-        .replace(/\|/g, '\\|')   // Вертикальная черта
-        .replace(/\{/g, '\\{')   // Фигурные скобки
-        .replace(/\}/g, '\\}')
-        .replace(/\./g, '\\.')   // Точка
-        .replace(/!/g, '\\!');   // Восклицательный знак
-};
-
-// Безопасная отправка сообщения с Markdown
-const sendMarkdownMessage = async (ctx, message) => {
-    try {
-        await ctx.reply(message, { parse_mode: 'Markdown' });
+      const { Pool } = require('pg');
+      const pool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+      });
+      
+      const client = await pool.connect();
+      
+      // Проверяем наличие колонки is_deleted
+      const checkResult = await client.query(`
+        SELECT column_name 
+        FROM information_schema.columns 
+        WHERE table_name = 'orders' AND column_name = 'is_deleted'
+      `);
+      
+      if (checkResult.rows.length === 0) {
+        console.log('⚠️ Колонки отсутствуют, выполняем миграцию...');
+        
+        // Добавляем колонки
+        await client.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS is_deleted INTEGER DEFAULT 0');
+        await client.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP');
+        await client.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS deleted_by TEXT');
+        await client.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS restored_at TIMESTAMP');
+        await client.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS restored_by TEXT');
+        await client.query('ALTER TABLE orders ADD COLUMN IF NOT EXISTS client_id INTEGER');
+        
+        console.log('✅ Колонки добавлены');
+        
+        // Заполняем client_id
+        const updateResult = await client.query(`
+          UPDATE orders o
+          SET client_id = (
+            SELECT c.id 
+            FROM users u 
+            JOIN clients c ON u.telegram_id = c.telegram_id 
+            WHERE u.id = o.user_id
+          )
+          WHERE client_id IS NULL
+        `);
+        console.log(`✅ Обновлено записей: ${updateResult.rowCount}`);
+        
+        // Добавляем whatsapp_group_id
+        await client.query('ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS whatsapp_group_id TEXT');
+        
+        // Настраиваем маршрутизацию
+        await client.query("UPDATE warehouses SET whatsapp_group_id = '120363419535622239@g.us' WHERE name = 'ЧБалхи'");
+        await client.query("UPDATE warehouses SET whatsapp_group_id = '120363422710745455@g.us' WHERE name = 'ЗаводТЧ'");
+        
+        console.log('✅ Маршрутизация настроена');
+        console.log('🎉 Автоматическая миграция завершена!');
+      } else {
+        console.log('✅ Миграция не требуется - все колонки на месте');
+      }
+      
+      client.release();
+      await pool.end();
     } catch (error) {
-        console.log('⚠️ Ошибка парсинга Markdown:', error.message);
-        console.log('📤 Отправляем как обычный текст');
-        // Убираем все Markdown форматирование и отправляем как обычный текст
-        const plainText = message
-            .replace(/\*([^*]+)\*/g, '$1')  // Убираем жирный текст
-            .replace(/_([^_]+)_/g, '$1')    // Убираем курсив
-            .replace(/`([^`]+)`/g, '$1')    // Убираем моноширинный текст
-            .replace(/\\(.)/g, '$1');       // Убираем экранирование
-        await ctx.reply(plainText);
+      console.error('⚠️ Ошибка автоматической миграции:', error.message);
+      console.log('💡 Выполните миграцию вручную: npm run migrate-postgres');
     }
-};
+  }
+}
 
-// Форматирование чисел (используем безопасную версию)
-const formatNumber = (num) => {
-    // 🔧 Используем безопасную функцию из модуля исправлений
-    if (typeof global.formatNumberSafe === 'function') {
-        return global.formatNumberSafe(num);
+// 🔧 Загружаем исправления для Order Bot (только если используется SQLite)
+try {
+  if (process.env.DB_PATH && !process.env.DATABASE_URL) {
+    const orderBotFixes = require('./fix-order-bot-soft-delete');
+    console.log('🔧 Исправления Order Bot загружены (SQLite)');
+  } else {
+    console.log('🔧 Используется PostgreSQL - исправления встроены');
+  }
+} catch (error) {
+  console.log('⚠️ Исправления Order Bot не загружены:', error.message);
+}
+
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+
+// Настройка команд администратора
+admin.setupAdminCommands(bot);
+
+// Временное хранилище данных заявки
+const orderData = new Map();
+
+// Очистка устаревших данных заявок (старше 2 часов)
+setInterval(() => {
+  const now = Date.now();
+  for (const [userId, data] of orderData.entries()) {
+    if (data.createdAt && (now - data.createdAt) > 2 * 60 * 60 * 1000) {
+      orderData.delete(userId);
+      console.log(`🧹 Очищены устаревшие данные заявки для пользователя ${userId}`);
+    }
+  }
+}, 30 * 60 * 1000); // Проверяем каждые 30 минут
+
+// Загрузка складов и товаров из БД через менеджер данных
+async function loadWarehousesAndProducts() {
+  // 🚀 Простая миграция через существующее подключение
+  try {
+    console.log('🔧 Проверка и настройка маршрутизации...');
+    
+    // Проверяем, нужна ли миграция
+    let needsMigration = false;
+    try {
+      // Пробуем получить WhatsApp группу - если ошибка, значит колонки нет
+      await database.getWarehouseWhatsApp('ЧБалхи');
+      console.log('✅ Колонка whatsapp_group_id существует');
+    } catch (error) {
+      if (error.code === 'SQLITE_ERROR' && error.message.includes('no such column')) {
+        needsMigration = true;
+        console.log('⚠️ Колонка whatsapp_group_id не найдена, нужна миграция');
+      } else {
+        console.log('⚠️ Другая ошибка при проверке колонки:', error.message);
+      }
     }
     
-    // Fallback на оригинальную функцию
-    return (num || 0).toFixed(2);
-};
-
-// Расчёт остатков
-const calculateStock = (data, year) => {
-    const yearData = data?.years?.[year];
-    if (!yearData) return null;
-
-    const balances = {};
-    // Фильтруем удаленные записи из приходов
-    (yearData.income || []).filter(item => !item.isDeleted).forEach(i => {
-        const key = `${i.warehouse}|${i.company}|${i.product}`;
-        if (!balances[key]) balances[key] = { warehouse: i.warehouse, company: i.company, product: i.product, income: 0, expense: 0 };
-        balances[key].income += i.qtyFact || 0;
-    });
-    // Фильтруем удаленные записи из расходов
-    (yearData.expense || []).filter(item => !item.isDeleted).forEach(e => {
-        const key = `${e.warehouse}|${e.company}|${e.product}`;
-        if (!balances[key]) balances[key] = { warehouse: e.warehouse, company: e.company, product: e.product, income: 0, expense: 0 };
-        balances[key].expense += e.quantity || 0;
-    });
-
-    const byWarehouse = {};
-    Object.values(balances).forEach(item => {
-        const balance = item.income - item.expense;
-        if (balance !== 0) {
-            if (!byWarehouse[item.warehouse]) byWarehouse[item.warehouse] = [];
-            byWarehouse[item.warehouse].push({ company: item.company, product: item.product, tons: balance / 20 });
-        }
-    });
-    return byWarehouse;
-};
-
-// Расчёт фактического остатка (как в веб-приложении)
-const calculateFactBalance = (data, year) => {
-    const yearData = data?.years?.[year];
-    if (!yearData) return null;
-
-    // Создаем структуру для хранения остатков
-    const summary = {};
-
-    // Обрабатываем приход
-    (yearData.income || []).filter(item => !item.isDeleted).forEach(item => {
-        const key = `${item.warehouse}-${item.company}-${item.product}`;
-        if (!summary[key]) {
-            summary[key] = {
-                warehouse: item.warehouse,
-                company: item.company,
-                product: item.product,
-                income: 0,
-                expense: 0
-            };
-        }
-        summary[key].income += parseFloat(item.qtyFact) || 0;
-    });
-
-    // Обрабатываем расход
-    (yearData.expense || []).filter(item => !item.isDeleted).forEach(item => {
-        const key = `${item.warehouse}-${item.company}-${item.product}`;
-        if (!summary[key]) {
-            summary[key] = {
-                warehouse: item.warehouse,
-                company: item.company,
-                product: item.product,
-                income: 0,
-                expense: 0
-            };
-        }
-        summary[key].expense += parseFloat(item.quantity) || 0;
-    });
-
-    // Группируем по складам и товарам
-    const warehouses = {};
-    const productTotals = {};
-    
-    // Получаем группы складов
-    const warehouseGroups = {};
-    (data.warehouses || []).forEach(w => {
-        if (w.name && w.group) {
-            warehouseGroups[w.name] = w.group;
-        }
-    });
-
-    Object.values(summary).forEach(item => {
-        const balance = item.income - item.expense;
-        const balanceTons = balance / 20;
-
-        if (balanceTons !== 0) {
-            // По складам
-            if (!warehouses[item.warehouse]) {
-                warehouses[item.warehouse] = {};
+    // Если нужна миграция, выполняем её через отдельное подключение
+    if (needsMigration) {
+      console.log('➕ Выполняем миграцию базы данных...');
+      
+      const sqlite3 = require('sqlite3').verbose();
+      const dbPath = process.env.DB_PATH || './orders.db';
+      
+      await new Promise((resolve, reject) => {
+        const migrationDb = new sqlite3.Database(dbPath, (err) => {
+          if (err) {
+            console.error('❌ Ошибка подключения для миграции:', err);
+            reject(err);
+            return;
+          }
+          
+          console.log('✅ Подключение для миграции создано');
+          
+          // Добавляем колонку
+          migrationDb.run("ALTER TABLE warehouses ADD COLUMN whatsapp_group_id TEXT", (err) => {
+            migrationDb.close(); // Сразу закрываем миграционное подключение
+            
+            if (err) {
+              console.error('❌ Ошибка добавления колонки:', err);
+              reject(err);
+            } else {
+              console.log('✅ Колонка whatsapp_group_id добавлена!');
+              resolve();
             }
-            if (!warehouses[item.warehouse][item.product]) {
-                warehouses[item.warehouse][item.product] = 0;
-            }
-            warehouses[item.warehouse][item.product] += balanceTons;
-
-            // Итого по товарам
-            if (!productTotals[item.product]) {
-                productTotals[item.product] = 0;
-            }
-            productTotals[item.product] += balanceTons;
-        }
-    });
-
-    return {
-        warehouses,
-        warehouseGroups,
-        productTotals
-    };
-};
-
-// Расчёт итогов вагонов
-const calculateWagonTotals = (data, year) => {
-    const yearData = data?.years?.[year];
-    if (!yearData || !yearData.income) return null;
-
-    const totals = {};
-
-    yearData.income.filter(item => !item.isDeleted).forEach(item => {
-        const key = `${item.product}-${item.company}-${item.warehouse}`;
-        if (!totals[key]) {
-            totals[key] = {
-                product: item.product || '',
-                company: item.company || '',
-                warehouse: item.warehouse || '',
-                wagons: 0,
-                qtyDoc: 0,
-                qtyFact: 0,
-                weightTons: 0
-            };
-        }
-        totals[key].wagons++;
-        totals[key].qtyDoc += parseFloat(item.qtyDoc) || 0;
-        totals[key].qtyFact += parseFloat(item.qtyFact) || 0;
-        totals[key].weightTons += (parseFloat(item.qtyFact) || 0) / 20;
-    });
-
-    const items = Object.values(totals);
-    
-    // Общие итоги
-    let grandTotalWagons = 0;
-    let grandTotalDoc = 0;
-    let grandTotalFact = 0;
-    let grandTotalWeight = 0;
-
-    items.forEach(item => {
-        grandTotalWagons += item.wagons;
-        grandTotalDoc += item.qtyDoc;
-        grandTotalFact += item.qtyFact;
-        grandTotalWeight += item.weightTons;
-    });
-
-    return {
-        items,
-        totals: {
-            wagons: grandTotalWagons,
-            qtyDoc: grandTotalDoc,
-            qtyFact: grandTotalFact,
-            difference: grandTotalFact - grandTotalDoc,
-            weightTons: grandTotalWeight
-        }
-    };
-};
-
-// Расчёт расхода по клиентам
-const calculateClientExpense = (data, year, dateFrom, dateTo) => {
-    const yearData = data?.years?.[year];
-    if (!yearData || !yearData.expense) return null;
-
-    let expense = yearData.expense;
-    
-    // Фильтрация по датам
-    if (dateFrom || dateTo) {
-        expense = expense.filter(item => {
-            const itemDate = new Date(item.date);
-            if (dateFrom && itemDate < dateFrom) return false;
-            if (dateTo && itemDate > dateTo) return false;
-            return true;
+          });
         });
+      });
+      
+      // Небольшая задержка после миграции
+      await new Promise(resolve => setTimeout(resolve, 500));
     }
     
-    // Формируем данные
-    const items = expense.map(item => ({
-        date: item.date || '',
-        client: item.client || '',
-        product: item.product || '',
-        company: item.company || '',
-        warehouse: item.warehouse || '',
-        quantity: parseFloat(item.quantity) || 0,
-        tons: (parseFloat(item.quantity) || 0) / 20,
-        price: parseFloat(item.price) || 0,
-        total: parseFloat(item.total) || 0,
-        notes: item.notes || ''
-    }));
+    // Настраиваем маршрутизацию через основное подключение database.js
+    console.log('🎯 Настройка маршрутизации складов...');
     
-    // Сортируем по дате
-    items.sort((a, b) => new Date(b.date) - new Date(a.date));
-    
-    // Итоги
-    let totalQty = 0, totalTons = 0, totalSum = 0;
-    items.forEach(item => {
-        totalQty += item.quantity;
-        totalTons += item.tons;
-        totalSum += item.total;
-    });
-    
-    return {
-        items,
-        totals: {
-            quantity: totalQty,
-            tons: totalTons,
-            sum: totalSum
-        }
-    };
-};
-
-// Расчёт отчёта за день (используем исправленную версию)
-const calculateDailyReport = (data, year, reportDate) => {
-    // 🔧 Используем исправленную функцию из модуля исправлений
-    if (typeof global.calculateDailyReportFixed === 'function') {
-        return global.calculateDailyReportFixed(data, year, reportDate);
+    try {
+      const balkhiUpdated = await database.updateWarehouseWhatsApp('ЧБалхи', '120363419535622239@g.us');
+      if (balkhiUpdated) {
+        console.log('✅ ЧБалхи → Бахор ойл склад');
+      } else {
+        console.log('⚠️ Склад ЧБалхи не найден');
+      }
+    } catch (error) {
+      console.log('❌ Ошибка настройки ЧБалхи:', error.message);
     }
     
-    // Fallback на оригинальную функцию если исправления не загружены
-    console.log('⚠️ Используем оригинальную функцию calculateDailyReport');
-    const yearData = data?.years?.[year];
-    if (!yearData) return { income: [], expense: [], totals: { expenseSum: 0 } };
-
-    // Фильтруем удаленные записи из приходов
-    const income = (yearData.income || []).filter(item => item.date === reportDate && !item.isDeleted).map(item => ({
-        date: item.date,
-        wagon: item.wagon || '',
-        company: item.company || '',
-        warehouse: item.warehouse || '',
-        product: item.product || '',
-        qtyDoc: parseFloat(item.qtyDoc) || 0,
-        qtyFact: parseFloat(item.qtyFact) || 0,
-        weightTons: (parseFloat(item.qtyFact) || 0) / 20
-    }));
-
-    // Фильтруем удаленные записи из расходов
-    const expense = (yearData.expense || []).filter(item => item.date === reportDate && !item.isDeleted).map(item => ({
-        date: item.date,
-        client: item.client || '',
-        company: item.company || '',
-        warehouse: item.warehouse || '',
-        product: item.product || '',
-        quantity: parseFloat(item.quantity) || 0,
-        tons: (parseFloat(item.quantity) || 0) / 20,
-        price: parseFloat(item.price) || 0,
-        total: parseFloat(item.total) || 0,
-        notes: item.notes || ''
-    }));
-
-    const expenseSum = expense.reduce((sum, item) => sum + item.total, 0);
-
-    return { income, expense, totals: { expenseSum } };
-};
-
-// Расчёт долгов (используем исправленную версию)
-const calculateDebts = (data, year) => {
-    // 🔧 Используем исправленную функцию из модуля исправлений
-    if (typeof global.calculateDebtsFixed === 'function') {
-        return global.calculateDebtsFixed(data, year);
+    try {
+      const zavodUpdated = await database.updateWarehouseWhatsApp('ЗаводТЧ', '120363422710745455@g.us');
+      if (zavodUpdated) {
+        console.log('✅ ЗаводТЧ → точик азод');
+      } else {
+        console.log('⚠️ Склад ЗаводТЧ не найден');
+      }
+    } catch (error) {
+      console.log('❌ Ошибка настройки ЗаводТЧ:', error.message);
     }
     
-    // Fallback на оригинальную функцию если исправления не загружены
-    console.log('⚠️ Используем оригинальную функцию calculateDebts');
-    const yearData = data?.years?.[year];
-    if (!yearData) return null;
-
-    const clientDebts = {};
+    console.log('🎉 Настройка маршрутизации завершена!');
     
-    // Суммируем все расходы по клиентам (total - сумма к оплате), исключая удаленные
-    (yearData.expense || []).filter(item => !item.isDeleted).forEach(e => {
-        if (!e.client) return;
-        if (!clientDebts[e.client]) clientDebts[e.client] = { total: 0, paid: 0 };
-        clientDebts[e.client].total += e.total || 0;
-    });
-    
-    // Суммируем все погашения по клиентам, исключая удаленные
-    (yearData.payments || []).filter(item => !item.isDeleted).forEach(p => {
-        if (!p.client) return;
-        if (!clientDebts[p.client]) clientDebts[p.client] = { total: 0, paid: 0 };
-        clientDebts[p.client].paid += p.amount || 0;
-    });
+  } catch (error) {
+    console.log('⚠️ Ошибка настройки маршрутизации:', error.message);
+  }
+  
+  // Загружаем данные через dataManager
+  return await dataManager.loadWarehousesAndProducts();
+}
 
-    // Вычисляем остаток долга
-    const result = {};
-    Object.entries(clientDebts).forEach(([client, d]) => {
-        const debt = d.total - d.paid;
-        if (debt > 0) {
-            result[client] = { total: d.total, paid: d.paid, debt };
-        }
-    });
-    return result;
-};
+// 🔄 Функция для принудительного обновления данных
+async function reloadWarehousesAndProducts() {
+  console.log('🔄 Принудительное обновление данных складов и товаров...');
+  try {
+    await dataManager.loadWarehousesAndProducts();
+    console.log('✅ Данные обновлены успешно');
+  } catch (error) {
+    console.error('❌ Ошибка обновления данных:', error);
+  }
+}
 
-// Клавиатуры
-const loginKeyboard = Markup.keyboard([['🔐 Войти']]).resize();
-const mainKeyboard = Markup.keyboard([
-    ['📦 Остатки складов', '🏭 Фактический остаток'],
-    ['💰 Долги клиентов', '📊 Сводка'],
-    ['📅 Отчёт за день', '📤 Расход за день'],
-    ['📋 Отчёты', '📆 Сменить год'],
-    ['🚪 Выйти']
-]).resize();
-// Клавиатура для администраторов (с кнопкой Управление)
-const adminKeyboard = Markup.keyboard([
-    ['📦 Остатки складов', '🏭 Фактический остаток'],
-    ['💰 Долги клиентов', '📊 Сводка'],
-    ['📅 Отчёт за день', '📤 Расход за день'],
-    ['📋 Отчёты', '⚙️ Управление'],
-    ['📆 Сменить год', '🚪 Выйти']
-]).resize();
-const reportsKeyboard = Markup.keyboard([
-    ['📈 Приход за период', '📉 Расход за период'],
-    ['💵 Погашения за период', '👥 Топ должников'],
-    ['🚂 Итоги вагонов', '👤 Карточка клиента'],
-    ['🔔 Уведомления о долгах', '🔙 Назад']
-]).resize();
-const managementKeyboard = Markup.keyboard([
-    ['👥 Пользователи', '📦 Товары'],
-    ['🏢 Фирмы', '🏪 Склады'],
-    ['👤 Клиенты', '💰 Цены'],
-    ['📅 Годы', '🔙 Назад в меню']
-]).resize();
+// Геттеры для получения текущих данных
+function getWarehouses() {
+  return dataManager.warehouses;
+}
 
-// Получить клавиатуру в зависимости от роли
-const getMainKeyboard = (userId) => {
-    const session = getSession(userId);
-    return session.role === 'admin' ? adminKeyboard : mainKeyboard;
-};
+function getProducts() {
+  return dataManager.products;
+}
 
-// Middleware проверки авторизации
-bot.use(async (ctx, next) => {
-    const userId = ctx.from?.id;
-    if (!userId) return;
+// Загружаем при старте
+setTimeout(loadWarehousesAndProducts, 1000);
+
+// Форматирование заявки для отправки
+function formatOrder(orderInfo) {
+  let message = '📦 НОВАЯ ЗАЯВКА\n\n';
+  message += `👤 Клиент: ${orderInfo.name}\n`;
+  message += `📞 Телефон: ${orderInfo.phone}\n`;
+  message += `🏬 Склад: ${orderInfo.warehouse}\n\n`;
+  message += `🛒 Товары:\n`;
+  
+  let totalQuantity = 0;
+  
+  orderInfo.items.forEach((item, index) => {
+    message += `${index + 1}) ${item.product} — ${item.quantity}\n`;
     
-    const text = ctx.message?.text || '';
-    const publicCommands = ['/start', '🔐 Войти', '/login'];
-    
-    if (publicCommands.some(cmd => text.startsWith(cmd))) return next();
-    if (getSession(userId).waitingForPassword) return next();
-    if (getSession(userId).waitingForUsername) return next();
-    if (getSession(userId).waitingForPrice) return next();
-    
-    if (!isAuthorized(userId)) {
-        return ctx.reply('⛔ Требуется авторизация!\n\nНажмите "🔐 Войти" или отправьте /start', loginKeyboard);
+    // Извлекаем число из quantity для подсчета итога
+    const quantityMatch = item.quantity.match(/(\d+)/);
+    if (quantityMatch) {
+      totalQuantity += parseInt(quantityMatch[1]);
     }
-    
-    return next();
-});
+  });
+  
+  message += `\n📊 Итого: ${totalQuantity} шт\n`;
+  message += `\n🚚 Транспорт: ${orderInfo.transport}\n`;
+  
+  if (orderInfo.comment) {
+    message += `📝 Комментарий: ${orderInfo.comment}\n`;
+  }
+  
+  message += `\n📅 Дата: ${new Date().toLocaleDateString('ru-RU')}`;
+  
+  return message;
+}
 
 // Команда /start
-bot.start(async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (isAuthorized(userId)) {
-        const session = getSession(userId);
-        const year = getUserYear(userId);
-        return ctx.reply(
-            `🏭 *Avesta - Система учёта*\n\n👤 Вы вошли как: *${session.username}*\n📅 Год: *${year}*\n\nВыберите действие:`,
-            { parse_mode: 'Markdown', ...getMainKeyboard(userId) }
-        );
-    }
-    
-    ctx.reply(
-        `🏭 *Avesta - Система учёта товаров*\n\nДля доступа к данным необходимо войти.\nИспользуйте логин и пароль из приложения.`,
-        { parse_mode: 'Markdown', ...loginKeyboard }
-    );
-});
-
-// Начало авторизации
-bot.hears(/🔐|\/login|войти/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (isAuthorized(userId)) {
-        return ctx.reply('✅ Вы уже авторизованы!', getMainKeyboard(userId));
-    }
-    
-    sessions[userId] = { waitingForUsername: true };
-    saveSessions();
-    ctx.reply('👤 Введите ваш логин:', Markup.removeKeyboard());
-});
-
-function getRoleText(role) {
-    const roles = { 'admin': '👑 Администратор', 'warehouse': '🏪 Завсклад', 'cashier': '💵 Кассир', 'manager': '📊 Менеджер' };
-    return roles[role] || role;
-}
-
-// Обработка ввода логина/пароля
-bot.on('text', async (ctx, next) => {
-    const userId = ctx.from.id;
-    const text = ctx.message.text.trim();
-    const session = getSession(userId);
-    
-    // Обработка ввода цены
-    if (session.waitingForPrice) {
-        const priceText = text;
-        const price = parseFloat(priceText.replace(',', '.'));
-        
-        if (isNaN(price) || price <= 0) {
-            return ctx.reply('❌ Введите корректную цену (число больше 0)');
-        }
-        
-        const product = session.selectedPriceProduct;
-        const group = session.selectedPriceGroup;
-        const username = session.username;
-        
-        // Сбрасываем состояние
-        sessions[userId].waitingForPrice = false;
-        sessions[userId].selectedPriceProduct = null;
-        sessions[userId].selectedPriceGroup = null;
-        saveSessions();
-        
-        await ctx.reply('⏳ Сохранение цены...');
-        
-        try {
-            // Сохраняем цену в Firebase
-            const today = new Date().toISOString().split('T')[0];
-            const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-            
-            const priceEntry = {
-                price: price,
-                time: time,
-                user: username,
-                timestamp: Date.now()
-            };
-            
-            // Получаем текущие данные
-            const data = await getData();
-            if (!data) {
-                return ctx.reply('❌ Ошибка подключения к базе данных', managementKeyboard);
-            }
-            
-            // Инициализируем структуру если нужно
-            if (!data.productPrices) data.productPrices = {};
-            if (!data.productPrices[today]) data.productPrices[today] = {};
-            if (!data.productPrices[today][product]) data.productPrices[today][product] = {};
-            if (!data.productPrices[today][product][group]) data.productPrices[today][product][group] = [];
-            
-            // Добавляем цену
-            data.productPrices[today][product][group].push(priceEntry);
-            
-            // Сохраняем в Firebase
-            if (firebaseDb) {
-                await firebaseDb.ref('retailAppData/productPrices').set(data.productPrices);
-            }
-            
-            const groupName = group === 'ALL' ? 'Все склады' : group;
-            
-            ctx.reply(
-                `✅ *Цена установлена!*\n\n` +
-                `📦 Товар: *${product}*\n` +
-                `🏪 Группа: *${groupName}*\n` +
-                `💰 Цена: *${formatNumber(price)} $* за тонну\n` +
-                `📅 Дата: ${today}\n` +
-                `🕐 Время: ${time}`,
-                { parse_mode: 'Markdown', ...managementKeyboard }
-            );
-            
-        } catch (e) {
-            console.error('Ошибка сохранения цены:', e);
-            ctx.reply('❌ Ошибка сохранения цены', managementKeyboard);
-        }
-        
-        return;
-    }
-    
-    if (session.waitingForUsername) {
-        sessions[userId] = { waitingForPassword: true, username: text };
-        saveSessions();
-        return ctx.reply('🔑 Введите пароль:');
-    }
-    
-    if (session.waitingForPassword) {
-        const username = session.username;
-        const password = text;
-        
-        try { await ctx.deleteMessage(); } catch (e) {}
-        
-        const hashedPassword = hashPassword(password);
-        
-        try {
-            const data = await getData();
-            
-            if (!data || !data.users) {
-                // Проверяем admin локально если Firebase недоступен
-                if (username === 'admin' && hashedPassword === hashPassword('P0l1uret@n@')) {
-                    sessions[userId] = { authorized: true, username: 'admin', role: 'admin', year: DEFAULT_YEAR };
-                    saveSessions();
-                    return ctx.reply(`✅ Добро пожаловать, *admin*!\n\n⚠️ База данных недоступна.`, { parse_mode: 'Markdown', ...getMainKeyboard(userId) });
-                }
-                sessions[userId] = {};
-                saveSessions();
-                return ctx.reply('❌ Ошибка подключения к базе данных.\nПопробуйте позже.', loginKeyboard);
-            }
-            
-            const user = data.users.find(u => u.username === username);
-            
-            if (!user) {
-                sessions[userId] = {};
-                saveSessions();
-                return ctx.reply('❌ Пользователь не найден!', loginKeyboard);
-            }
-            
-            if (user.blocked) {
-                sessions[userId] = {};
-                saveSessions();
-                return ctx.reply('⛔ Ваш аккаунт заблокирован!', loginKeyboard);
-            }
-            
-            if (user.password !== hashedPassword && user.password !== password) {
-                sessions[userId] = {};
-                saveSessions();
-                return ctx.reply('❌ Неверный пароль!', loginKeyboard);
-            }
-            
-            sessions[userId] = { 
-                authorized: true, 
-                username: user.username, 
-                role: user.role, 
-                year: DEFAULT_YEAR,
-                warehouseGroup: user.warehouseGroup || []
-            };
-            saveSessions();
-            
-            ctx.reply(
-                `✅ Добро пожаловать, *${user.username}*!\n\n👤 Роль: ${getRoleText(user.role)}\n📅 Год: *${DEFAULT_YEAR}*\n\nВыберите действие:`,
-                { parse_mode: 'Markdown', ...getMainKeyboard(userId) }
-            );
-            
-        } catch (err) {
-            console.error('Ошибка авторизации:', err);
-            sessions[userId] = {};
-            saveSessions();
-            ctx.reply('❌ Ошибка авторизации. Попробуйте позже.', loginKeyboard);
-        }
-        return;
-    }
-    
-    return next();
-});
-
-// Выход
-bot.hears(/🚪|\/logout|выйти/i, async (ctx) => {
-    const userId = ctx.from.id;
-    sessions[userId] = {};
-    saveSessions();
-    ctx.reply('👋 Вы вышли из системы.', loginKeyboard);
-});
-
-// Смена года
-bot.hears(/📆|\/year|сменить год/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const currentYear = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка списка годов...');
-    
-    try {
-        const data = await getData();
-        if (!data || !data.years) {
-            return ctx.reply('❌ Не удалось получить список годов');
-        }
-        
-        const years = Object.keys(data.years).sort().reverse();
-        
-        if (years.length === 0) {
-            return ctx.reply('📅 Нет доступных годов');
-        }
-        
-        // Создаём inline кнопки для годов
-        const buttons = years.map(year => {
-            const marker = year === currentYear ? ' ✓' : '';
-            return [Markup.button.callback(`📅 ${year}${marker}`, `year_${year}`)];
-        });
-        
-        ctx.reply(
-            `📅 *Выберите год*\n\nТекущий год: *${currentYear}*`,
-            {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard(buttons)
-            }
-        );
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки списка годов');
-    }
-});
-
-// Обработка выбора года
-bot.action(/^year_(\d{4})$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = ctx.match[1];
-    
-    setUserYear(userId, year);
-    
-    await ctx.answerCbQuery(`✅ Год изменён на ${year}`);
-    await ctx.editMessageText(
-        `✅ Год успешно изменён на *${year}*`,
-        { parse_mode: 'Markdown' }
-    );
-    
-    ctx.reply(`📅 Теперь данные отображаются за *${year}* год`, { parse_mode: 'Markdown', ...getMainKeyboard(userId) });
-});
-
-// Меню отчётов
-bot.hears(/📋|\/reports|отчёты|отчеты/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    ctx.reply(
-        `📋 *МЕНЮ ОТЧЁТОВ*\n📅 Год: *${year}*\n\nВыберите тип отчёта:`,
-        { parse_mode: 'Markdown', ...reportsKeyboard }
-    );
-});
-
-// Назад в главное меню
-bot.hears(/🔙 Назад в меню|назад в меню/i, async (ctx) => {
-    const userId = ctx.from.id;
-    ctx.reply('🏠 Главное меню', getMainKeyboard(userId));
-});
-
-// Назад из отчётов
-bot.hears(/🔙|назад/i, async (ctx) => {
-    const userId = ctx.from.id;
-    ctx.reply('🏠 Главное меню', getMainKeyboard(userId));
-});
-
-// ==================== МЕНЮ УПРАВЛЕНИЯ (только для админов) ====================
-
-// Проверка прав администратора
-const isAdmin = (userId) => {
-    const session = getSession(userId);
-    return session.role === 'admin';
-};
-
-// Меню управления
-bot.hears(/⚙️|управление/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (!isAdmin(userId)) {
-        return ctx.reply('⛔ Доступ запрещён! Только для администраторов.');
-    }
-    
-    ctx.reply(
-        `⚙️ *УПРАВЛЕНИЕ*\n\nВыберите раздел:`,
-        { parse_mode: 'Markdown', ...managementKeyboard }
-    );
-});
-
-// Список пользователей
-bot.hears(/👥 Пользователи/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (!isAdmin(userId)) {
-        return ctx.reply('⛔ Доступ запрещён!');
-    }
-    
-    await ctx.reply('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data || !data.users) {
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        let msg = `👥 *ПОЛЬЗОВАТЕЛИ*\n${'═'.repeat(25)}\n\n`;
-        
-        data.users.forEach((user, i) => {
-            const status = user.blocked ? '🔒' : '✅';
-            const roleIcon = user.role === 'admin' ? '👑' : user.role === 'warehouse' ? '🏪' : user.role === 'cashier' ? '💵' : '📊';
-            msg += `${i + 1}. ${status} *${user.username}*\n`;
-            msg += `   ${roleIcon} ${getRoleText(user.role)}\n`;
-            if (user.warehouseGroup && user.warehouseGroup.length > 0 && user.warehouseGroup[0]) {
-                msg += `   🏪 Группы: ${user.warehouseGroup.join(', ')}\n`;
-            }
-            msg += `\n`;
-        });
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 Всего: *${data.users.length}* пользователей`;
-        
-        ctx.reply(msg, { parse_mode: 'Markdown' });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Список товаров
-bot.hears(/📦 Товары/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (!isAdmin(userId)) {
-        return ctx.reply('⛔ Доступ запрещён!');
-    }
-    
-    await ctx.reply('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data || !data.products) {
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        let msg = `📦 *ТОВАРЫ*\n${'═'.repeat(25)}\n\n`;
-        
-        if (data.products.length === 0) {
-            msg += `_Список пуст_\n`;
-        } else {
-            data.products.forEach((product, i) => {
-                msg += `${i + 1}. ${product}\n`;
-            });
-        }
-        
-        msg += `\n${'═'.repeat(25)}\n`;
-        msg += `📊 Всего: *${data.products.length}* товаров`;
-        
-        // Кнопка добавления
-        const addButton = Markup.inlineKeyboard([
-            [Markup.button.callback('➕ Добавить товар', 'add_product')]
-        ]);
-        
-        ctx.reply(msg, { parse_mode: 'Markdown', ...addButton });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Добавление товара - начало
-bot.action('add_product', async (ctx) => {
-    const userId = ctx.from.id;
-    if (!isAdmin(userId)) return ctx.answerCbQuery('⛔ Доступ запрещён!');
-    
-    await ctx.answerCbQuery();
-    sessions[userId].waitingForNewProduct = true;
-    saveSessions();
-    
-    ctx.reply('📦 Введите название нового товара:', Markup.inlineKeyboard([
-        [Markup.button.callback('❌ Отмена', 'cancel_add')]
-    ]));
-});
-
-// Добавление товара - обработка ввода
-bot.on('text', async (ctx, next) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    const text = ctx.message.text.trim();
-    
-    // Добавление товара
-    if (session.waitingForNewProduct) {
-        sessions[userId].waitingForNewProduct = false;
-        saveSessions();
-        
-        if (text.startsWith('/') || text.startsWith('🔙')) {
-            return ctx.reply('❌ Отменено', managementKeyboard);
-        }
-        
-        try {
-            const data = await getData();
-            if (!data) return ctx.reply('❌ Ошибка подключения к базе', managementKeyboard);
-            
-            // Проверяем, существует ли уже
-            if (data.products && data.products.includes(text)) {
-                return ctx.reply(`❌ Товар "${text}" уже существует!`, managementKeyboard);
-            }
-            
-            // Добавляем
-            if (!data.products) data.products = [];
-            data.products.push(text);
-            data.products.sort();
-            
-            // Сохраняем в Firebase
-            if (firebaseDb) {
-                await firebaseDb.ref('retailAppData/products').set(data.products);
-            }
-            
-            ctx.reply(`✅ Товар "*${text}*" добавлен!`, { parse_mode: 'Markdown', ...managementKeyboard });
-        } catch (e) {
-            console.error('Ошибка:', e);
-            ctx.reply('❌ Ошибка сохранения', managementKeyboard);
-        }
-        return;
-    }
-    
-    // Добавление фирмы
-    if (session.waitingForNewCompany) {
-        sessions[userId].waitingForNewCompany = false;
-        saveSessions();
-        
-        if (text.startsWith('/') || text.startsWith('🔙')) {
-            return ctx.reply('❌ Отменено', managementKeyboard);
-        }
-        
-        try {
-            const data = await getData();
-            if (!data) return ctx.reply('❌ Ошибка подключения к базе', managementKeyboard);
-            
-            if (data.companies && data.companies.includes(text)) {
-                return ctx.reply(`❌ Фирма "${text}" уже существует!`, managementKeyboard);
-            }
-            
-            if (!data.companies) data.companies = [];
-            data.companies.push(text);
-            data.companies.sort();
-            
-            if (firebaseDb) {
-                await firebaseDb.ref('retailAppData/companies').set(data.companies);
-            }
-            
-            ctx.reply(`✅ Фирма "*${text}*" добавлена!`, { parse_mode: 'Markdown', ...managementKeyboard });
-        } catch (e) {
-            console.error('Ошибка:', e);
-            ctx.reply('❌ Ошибка сохранения', managementKeyboard);
-        }
-        return;
-    }
-    
-    // Добавление клиента
-    if (session.waitingForNewClient) {
-        sessions[userId].waitingForNewClient = false;
-        saveSessions();
-        
-        if (text.startsWith('/') || text.startsWith('🔙')) {
-            return ctx.reply('❌ Отменено', managementKeyboard);
-        }
-        
-        try {
-            const data = await getData();
-            if (!data) return ctx.reply('❌ Ошибка подключения к базе', managementKeyboard);
-            
-            // Получаем текущих клиентов
-            let clients = [];
-            if (Array.isArray(data.clients)) {
-                clients = data.clients.map(c => typeof c === 'string' ? c : (c.name || ''));
-            }
-            
-            if (clients.includes(text)) {
-                return ctx.reply(`❌ Клиент "${text}" уже существует!`, managementKeyboard);
-            }
-            
-            // Добавляем как объект с именем
-            if (!data.clients) data.clients = [];
-            data.clients.push({ name: text });
-            
-            // Сортируем
-            data.clients.sort((a, b) => {
-                const nameA = typeof a === 'string' ? a : (a.name || '');
-                const nameB = typeof b === 'string' ? b : (b.name || '');
-                return nameA.localeCompare(nameB);
-            });
-            
-            if (firebaseDb) {
-                await firebaseDb.ref('retailAppData/clients').set(data.clients);
-            }
-            
-            ctx.reply(`✅ Клиент "*${text}*" добавлен!`, { parse_mode: 'Markdown', ...managementKeyboard });
-        } catch (e) {
-            console.error('Ошибка:', e);
-            ctx.reply('❌ Ошибка сохранения', managementKeyboard);
-        }
-        return;
-    }
-    
-    return next();
-});
-
-// Отмена добавления
-bot.action('cancel_add', async (ctx) => {
-    const userId = ctx.from.id;
-    sessions[userId].waitingForNewProduct = false;
-    sessions[userId].waitingForNewCompany = false;
-    sessions[userId].waitingForNewClient = false;
-    saveSessions();
-    
-    await ctx.answerCbQuery('Отменено');
-    ctx.reply('❌ Отменено', managementKeyboard);
-});
-
-// Список фирм
-bot.hears(/🏢 Фирмы/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (!isAdmin(userId)) {
-        return ctx.reply('⛔ Доступ запрещён!');
-    }
-    
-    await ctx.reply('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data || !data.companies) {
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        let msg = `🏢 *ФИРМЫ*\n${'═'.repeat(25)}\n\n`;
-        
-        if (data.companies.length === 0) {
-            msg += `_Список пуст_\n`;
-        } else {
-            data.companies.forEach((company, i) => {
-                msg += `${i + 1}. ${company}\n`;
-            });
-        }
-        
-        msg += `\n${'═'.repeat(25)}\n`;
-        msg += `📊 Всего: *${data.companies.length}* фирм`;
-        
-        // Кнопка добавления
-        const addButton = Markup.inlineKeyboard([
-            [Markup.button.callback('➕ Добавить фирму', 'add_company')]
-        ]);
-        
-        ctx.reply(msg, { parse_mode: 'Markdown', ...addButton });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Добавление фирмы - начало
-bot.action('add_company', async (ctx) => {
-    const userId = ctx.from.id;
-    if (!isAdmin(userId)) return ctx.answerCbQuery('⛔ Доступ запрещён!');
-    
-    await ctx.answerCbQuery();
-    sessions[userId].waitingForNewCompany = true;
-    saveSessions();
-    
-    ctx.reply('🏢 Введите название новой фирмы:', Markup.inlineKeyboard([
-        [Markup.button.callback('❌ Отмена', 'cancel_add')]
-    ]));
-});
-
-// Список складов
-bot.hears(/🏪 Склады/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (!isAdmin(userId)) {
-        return ctx.reply('⛔ Доступ запрещён!');
-    }
-    
-    await ctx.reply('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data || !data.warehouses) {
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        if (data.warehouses.length === 0) {
-            return ctx.reply('🏪 Список складов пуст');
-        }
-        
-        let msg = `🏪 *СКЛАДЫ*\n${'═'.repeat(25)}\n\n`;
-        
-        // Группируем по группам
-        const byGroup = {};
-        data.warehouses.forEach(wh => {
-            const group = wh.group || 'Без группы';
-            if (!byGroup[group]) byGroup[group] = [];
-            byGroup[group].push(wh.name);
-        });
-        
-        Object.entries(byGroup).forEach(([group, warehouses]) => {
-            msg += `📁 *${group}*\n`;
-            warehouses.forEach((wh, i) => {
-                msg += `   ${i + 1}. ${wh}\n`;
-            });
-            msg += `\n`;
-        });
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 Всего: *${data.warehouses.length}* складов`;
-        
-        ctx.reply(msg, { parse_mode: 'Markdown' });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Список клиентов
-bot.hears(/👤 Клиенты/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (!isAdmin(userId)) {
-        return ctx.reply('⛔ Доступ запрещён!');
-    }
-    
-    await ctx.reply('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data || !data.clients) {
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        // Получаем имена клиентов (могут быть объекты или строки)
-        let clientNames = [];
-        if (Array.isArray(data.clients)) {
-            data.clients.forEach(c => {
-                // Фильтруем удаленных клиентов
-                if (typeof c === 'string') {
-                    clientNames.push(c);
-                } else if (c && c.name && !c.isDeleted) {
-                    clientNames.push(c.name);
-                }
-            });
-        } else if (typeof data.clients === 'object') {
-            Object.values(data.clients).forEach(c => {
-                // Фильтруем удаленных клиентов
-                if (typeof c === 'string') {
-                    clientNames.push(c);
-                } else if (c && c.name && !c.isDeleted) {
-                    clientNames.push(c.name);
-                }
-            });
-        }
-        
-        // Сортируем
-        clientNames.sort();
-        
-        let msg = `👤 *КЛИЕНТЫ*\n${'═'.repeat(25)}\n\n`;
-        
-        if (clientNames.length === 0) {
-            msg += `_Список пуст_\n`;
-        } else {
-            // Показываем всех клиентов (убираем лимит 50)
-            clientNames.forEach((client, i) => {
-                msg += `${i + 1}. ${client}\n`;
-            });
-        }
-        
-        msg += `\n${'═'.repeat(25)}\n`;
-        msg += `📊 Всего: *${clientNames.length}* клиентов`;
-        
-        // Кнопка добавления
-        const addButton = Markup.inlineKeyboard([
-            [Markup.button.callback('➕ Добавить клиента', 'add_client')]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...addButton });
-        } else {
-            ctx.reply(msg, { parse_mode: 'Markdown', ...addButton });
-        }
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Добавление клиента - начало
-bot.action('add_client', async (ctx) => {
-    const userId = ctx.from.id;
-    if (!isAdmin(userId)) return ctx.answerCbQuery('⛔ Доступ запрещён!');
-    
-    await ctx.answerCbQuery();
-    sessions[userId].waitingForNewClient = true;
-    saveSessions();
-    
-    ctx.reply('👤 Введите имя нового клиента:', Markup.inlineKeyboard([
-        [Markup.button.callback('❌ Отмена', 'cancel_add')]
-    ]));
-});
-
-// Список годов
-bot.hears(/📅 Годы/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (!isAdmin(userId)) {
-        return ctx.reply('⛔ Доступ запрещён!');
-    }
-    
-    await ctx.reply('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data || !data.years) {
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        const years = Object.keys(data.years).sort().reverse();
-        
-        if (years.length === 0) {
-            return ctx.reply('📅 Нет данных по годам');
-        }
-        
-        let msg = `📅 *ГОДЫ*\n${'═'.repeat(25)}\n\n`;
-        
-        years.forEach(year => {
-            const yearData = data.years[year];
-            const incomeCount = (yearData.income || []).length;
-            const expenseCount = (yearData.expense || []).length;
-            const paymentsCount = (yearData.payments || []).length;
-            
-            msg += `📅 *${year}*\n`;
-            msg += `   📦 Приход: ${incomeCount} записей\n`;
-            msg += `   📤 Расход: ${expenseCount} записей\n`;
-            msg += `   💵 Погашения: ${paymentsCount} записей\n\n`;
-        });
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 Всего: *${years.length}* годов`;
-        
-        ctx.reply(msg, { parse_mode: 'Markdown' });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Управление ценами
-bot.hears(/💰 Цены/i, async (ctx) => {
-    const userId = ctx.from.id;
-    
-    if (!isAdmin(userId)) {
-        return ctx.reply('⛔ Доступ запрещён!');
-    }
-    
-    await ctx.reply('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data) {
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        const today = new Date().toISOString().split('T')[0];
-        const prices = data.productPrices || {};
-        
-        let msg = `💰 *УПРАВЛЕНИЕ ЦЕНАМИ*\n${'═'.repeat(25)}\n\n`;
-        
-        // Показываем текущие цены на сегодня
-        msg += `📅 *Цены на сегодня (${today}):*\n${'─'.repeat(20)}\n\n`;
-        
-        const todayPrices = prices[today];
-        if (todayPrices && Object.keys(todayPrices).length > 0) {
-            Object.entries(todayPrices).forEach(([product, groups]) => {
-                msg += `📦 *${product}*\n`;
-                Object.entries(groups).forEach(([group, priceList]) => {
-                    if (priceList && priceList.length > 0) {
-                        const lastPrice = priceList[priceList.length - 1];
-                        const groupName = group === 'ALL' ? '🌍 Все склады' : `🏪 ${group}`;
-                        msg += `   ${groupName}: *${formatNumber(lastPrice.price)} $* за тонну\n`;
-                    }
-                });
-                msg += `\n`;
-            });
-        } else {
-            msg += `_Цены на сегодня не установлены_\n\n`;
-        }
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `\n💡 Для установки цены нажмите кнопку ниже`;
-        
-        // Сохраняем список товаров для выбора
-        sessions[userId].priceProducts = data.products || [];
-        sessions[userId].priceWarehouses = data.warehouses || [];
-        saveSessions();
-        
-        const buttons = Markup.inlineKeyboard([
-            [Markup.button.callback('➕ Установить цену', 'price_add')],
-            [Markup.button.callback('📋 История цен', 'price_history')]
-        ]);
-        
-        ctx.reply(msg, { parse_mode: 'Markdown', ...buttons });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Начало установки цены - выбор товара
-bot.action('price_add', async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    await ctx.answerCbQuery();
-    
-    const products = session.priceProducts || [];
-    
-    if (products.length === 0) {
-        return ctx.reply('❌ Список товаров пуст');
-    }
-    
-    // Создаём кнопки для товаров (максимум 10)
-    const buttons = products.slice(0, 10).map((product, i) => 
-        [Markup.button.callback(`📦 ${product}`, `prprod_${i}`)]
-    );
-    buttons.push([Markup.button.callback('❌ Отмена', 'price_cancel')]);
-    
-    ctx.reply(
-        `📦 *Выберите товар:*`,
-        { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
-    );
-});
-
-// Выбор товара для цены
-bot.action(/^prprod_(\d+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    const productIndex = parseInt(ctx.match[1]);
-    
-    await ctx.answerCbQuery();
-    
-    const products = session.priceProducts || [];
-    const product = products[productIndex];
-    
-    if (!product) {
-        return ctx.reply('❌ Товар не найден');
-    }
-    
-    // Сохраняем выбранный товар
-    sessions[userId].selectedPriceProduct = product;
-    saveSessions();
-    
-    // Получаем группы складов
-    const warehouses = session.priceWarehouses || [];
-    const groups = [...new Set(warehouses.map(w => w.group).filter(g => g))];
-    
-    // Создаём кнопки для групп
-    const buttons = [
-        [Markup.button.callback('🌍 Все склады (глобальная)', 'prgrp_ALL')]
+bot.command('start', async (ctx) => {
+  const userId = ctx.from.id;
+  const userName = ctx.from.first_name || ctx.from.username || 'Пользователь';
+  
+  // Проверка прав доступа
+  const isAdminUser = admin.isAdmin(userId);
+  const isClientUser = await database.isClient(userId);
+  
+  if (isAdminUser) {
+    const keyboard = [
+      [{ text: '📦 Создать заявку' }],
+      [{ text: '👨‍💼 Панель администратора' }]
     ];
-    groups.slice(0, 8).forEach((group, i) => {
-        buttons.push([Markup.button.callback(`🏪 ${group}`, `prgrp_${i}`)]);
-    });
-    buttons.push([Markup.button.callback('❌ Отмена', 'price_cancel')]);
     
-    // Сохраняем группы
-    sessions[userId].priceGroups = groups;
-    saveSessions();
-    
-    ctx.reply(
-        `📦 Товар: *${product}*\n\n🏪 *Выберите группу складов:*`,
-        { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) }
+    return ctx.reply(
+      '👋 Добро пожаловать, администратор!\n\n' +
+      'Выберите действие:',
+      { reply_markup: { keyboard, resize_keyboard: true } }
     );
-});
-
-// Выбор группы складов
-bot.action(/^prgrp_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    const groupParam = ctx.match[1];
+  }
+  
+  if (isClientUser) {
+    // Показываем постоянное меню
+    const keyboard = [
+      [{ text: '🏬 Склад' }]
+    ];
     
-    await ctx.answerCbQuery();
-    
-    let group;
-    if (groupParam === 'ALL') {
-        group = 'ALL';
-    } else {
-        const groupIndex = parseInt(groupParam);
-        const groups = session.priceGroups || [];
-        group = groups[groupIndex];
-    }
-    
-    if (!group) {
-        return ctx.reply('❌ Группа не найдена');
-    }
-    
-    // Сохраняем выбранную группу
-    sessions[userId].selectedPriceGroup = group;
-    sessions[userId].waitingForPrice = true;
-    saveSessions();
-    
-    const product = session.selectedPriceProduct;
-    const groupName = group === 'ALL' ? 'Все склады' : group;
-    
-    ctx.reply(
-        `📦 Товар: *${product}*\n🏪 Группа: *${groupName}*\n\n💰 *Введите цену за тонну (в $):*`,
-        { parse_mode: 'Markdown', ...Markup.removeKeyboard() }
+    return ctx.reply(
+      '👋 Добро пожаловать в систему приема заявок!\n\n' +
+      'Нажмите "🏬 Склад" чтобы создать заявку',
+      { reply_markup: { keyboard, resize_keyboard: true } }
     );
-});
-
-// Отмена установки цены
-bot.action('price_cancel', async (ctx) => {
-    const userId = ctx.from.id;
-    
-    sessions[userId].waitingForPrice = false;
-    sessions[userId].selectedPriceProduct = null;
-    sessions[userId].selectedPriceGroup = null;
-    saveSessions();
-    
-    await ctx.answerCbQuery('Отменено');
-    ctx.reply('❌ Установка цены отменена', managementKeyboard);
-});
-
-// История цен
-bot.action('price_history', async (ctx) => {
-    const userId = ctx.from.id;
-    
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data || !data.productPrices) {
-            return ctx.reply('📋 История цен пуста');
-        }
-        
-        const prices = data.productPrices;
-        const allEntries = [];
-        
-        // Собираем все записи
-        Object.entries(prices).forEach(([date, products]) => {
-            Object.entries(products).forEach(([product, groups]) => {
-                Object.entries(groups).forEach(([group, priceList]) => {
-                    priceList.forEach(entry => {
-                        allEntries.push({
-                            date,
-                            product,
-                            group: group === 'ALL' ? 'Все склады' : group,
-                            price: entry.price,
-                            user: entry.user || 'admin',
-                            time: entry.time || ''
-                        });
-                    });
-                });
-            });
-        });
-        
-        // Сортируем по дате (новые сверху)
-        allEntries.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        if (allEntries.length === 0) {
-            return ctx.reply('📋 История цен пуста');
-        }
-        
-        let msg = `📋 *ИСТОРИЯ ЦЕН*\n${'═'.repeat(25)}\n\n`;
-        
-        // Показываем последние 20 записей
-        allEntries.slice(0, 20).forEach((entry, i) => {
-            msg += `${i + 1}. *${entry.date}* ${entry.time}\n`;
-            msg += `   📦 ${entry.product}\n`;
-            msg += `   🏪 ${entry.group}\n`;
-            msg += `   💰 *${formatNumber(entry.price)} $* за тонну\n`;
-            msg += `   👤 ${entry.user}\n\n`;
-        });
-        
-        if (allEntries.length > 20) {
-            msg += `_...и ещё ${allEntries.length - 20} записей_`;
-        }
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (const part of parts) {
-                await ctx.reply(part, { parse_mode: 'Markdown' });
-            }
-        } else {
-            ctx.reply(msg, { parse_mode: 'Markdown' });
-        }
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// ==================== КОНЕЦ МЕНЮ УПРАВЛЕНИЯ ====================
-
-// Приход за период
-bot.hears(/📈|приход за период/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка...');
-    try {
-        const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.income || yearData.income.length === 0) {
-            return ctx.reply(`📈 Нет данных о приходе за ${year} год`);
-        }
-        
-        // Группируем по месяцам
-        const byMonth = {};
-        yearData.income.filter(item => !item.isDeleted).forEach(item => {
-            const date = new Date(item.date);
-            const month = date.toLocaleString('ru', { month: 'long' });
-            if (!byMonth[month]) byMonth[month] = { count: 0, tons: 0 };
-            byMonth[month].count++;
-            byMonth[month].tons += (item.qtyFact || 0) / 20;
-        });
-        
-        let msg = `📈 *ПРИХОД ЗА ${year}*\n${'─'.repeat(20)}\n\n`;
-        let totalTons = 0;
-        let totalCount = 0;
-        
-        Object.entries(byMonth).forEach(([month, data]) => {
-            msg += `📅 *${month}*: ${data.count} записей, ${formatNumber(data.tons)} т\n`;
-            totalTons += data.tons;
-            totalCount += data.count;
-        });
-        
-        msg += `\n${'─'.repeat(20)}\n`;
-        msg += `📊 Всего: *${totalCount}* записей\n`;
-        msg += `📦 Итого: *${formatNumber(totalTons)} тонн*`;
-        
-        // Кнопка для детального отчёта
-        const detailButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📋 Детальный за период', 'income_detail_menu')]
-        ]);
-        
-        ctx.reply(msg, { parse_mode: 'Markdown', ...detailButton });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Меню выбора периода для детального прихода
-bot.action('income_detail_menu', async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.answerCbQuery();
-    
-    const periodButtons = Markup.inlineKeyboard([
-        [Markup.button.callback('📅 Сегодня', 'incdet_today'), Markup.button.callback('📅 Вчера', 'incdet_yesterday')],
-        [Markup.button.callback('📅 Эта неделя', 'incdet_week'), Markup.button.callback('📅 Этот месяц', 'incdet_month')],
-        [Markup.button.callback('📅 Весь год', 'incdet_year')]
-    ]);
-    
-    ctx.reply(
-        `📋 *ДЕТАЛЬНЫЙ ПРИХОД*\n📅 Год: *${year}*\n\nВыберите период:`,
-        { parse_mode: 'Markdown', ...periodButtons }
+  }
+  
+  // Пользователь не зарегистрирован - отправляем запрос администратору
+  const pendingRequest = await database.getPendingRequest(userId);
+  
+  if (pendingRequest) {
+    return ctx.reply(
+      '⏳ Ваш запрос на регистрацию уже отправлен администратору.\n\n' +
+      'Пожалуйста, ожидайте подтверждения.'
     );
-});
-
-// Обработка выбора периода для детального прихода
-bot.action(/^incdet_(today|yesterday|week|month|year)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const periodType = ctx.match[1];
-    
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
+  }
+  
+  // Создаем запрос на регистрацию
+  await database.createRegistrationRequest(userId, userName, ctx.from.username);
+  
+  ctx.reply(
+    '📝 Ваш запрос на регистрацию отправлен администратору.\n\n' +
+    'Вы получите уведомление, когда администратор одобрит вашу заявку.\n\n' +
+    'Ваш Telegram ID: ' + userId
+  );
+  
+  // Уведомление всем администраторам
+  for (const adminId of admin.ADMINS) {
     try {
-        const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.income || yearData.income.length === 0) {
-            return ctx.reply(`📈 Нет данных о приходе за ${year} год`);
-        }
-        
-        // Определяем период
-        const today = new Date();
-        let dateFrom, dateTo, periodName;
-        
-        switch (periodType) {
-            case 'today':
-                dateFrom = new Date(today.toISOString().split('T')[0]);
-                dateTo = new Date(today.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Сегодня';
-                break;
-            case 'yesterday':
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Вчера';
-                break;
-            case 'week':
-                dateFrom = new Date(today);
-                dateFrom.setDate(dateFrom.getDate() - 7);
-                dateTo = today;
-                periodName = 'За неделю';
-                break;
-            case 'month':
-                dateFrom = new Date(today);
-                dateFrom.setMonth(dateFrom.getMonth() - 1);
-                dateTo = today;
-                periodName = 'За месяц';
-                break;
-            case 'year':
-                dateFrom = null;
-                dateTo = null;
-                periodName = `За ${year} год`;
-                break;
-        }
-        
-        // Фильтруем данные (исключаем удаленные записи)
-        let income = yearData.income.filter(item => !item.isDeleted);
-        if (dateFrom && dateTo) {
-            income = income.filter(item => {
-                const itemDate = new Date(item.date);
-                return itemDate >= dateFrom && itemDate <= dateTo;
-            });
-        }
-        
-        if (income.length === 0) {
-            return ctx.reply(`📈 Нет данных о приходе за выбранный период`);
-        }
-        
-        // Формируем данные для отчёта
-        const items = income.map(item => ({
-            date: item.date || '',
-            wagon: item.wagon || '',
-            company: item.company || '',
-            warehouse: item.warehouse || '',
-            product: item.product || '',
-            qtyDoc: parseFloat(item.qtyDoc) || 0,
-            qtyFact: parseFloat(item.qtyFact) || 0,
-            difference: (parseFloat(item.qtyFact) || 0) - (parseFloat(item.qtyDoc) || 0),
-            weightTons: (parseFloat(item.qtyFact) || 0) / 20,
-            notes: item.notes || ''
-        }));
-        
-        // Сортируем по дате (новые сверху)
-        items.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        // Итоги
-        let totalDoc = 0, totalFact = 0, totalTons = 0;
-        items.forEach(item => {
-            totalDoc += item.qtyDoc;
-            totalFact += item.qtyFact;
-            totalTons += item.weightTons;
-        });
-        
-        let msg = `📋 *ДЕТАЛЬНЫЙ ПРИХОД*\n`;
-        msg += `📅 ${periodName}\n`;
-        msg += `${'═'.repeat(25)}\n\n`;
-        
-        // Показываем до 15 записей
-        const showItems = items.slice(0, 15);
-        showItems.forEach((item, i) => {
-            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
-            msg += `${i + 1}. *${formattedDate}*\n`;
-            msg += `   🚂 ${item.wagon} | ${item.product}\n`;
-            msg += `   ${item.company} → ${item.warehouse}\n`;
-            msg += `   📄 ${item.qtyDoc} | ✅ ${item.qtyFact} | ⚖️ ${formatNumber(item.weightTons)} т\n\n`;
-        });
-        
-        if (items.length > 15) {
-            msg += `_...и ещё ${items.length - 15} записей_\n\n`;
-        }
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 *ИТОГО:* ${items.length} записей\n`;
-        msg += `   📄 По док: *${totalDoc}* шт\n`;
-        msg += `   ✅ Факт: *${totalFact}* шт\n`;
-        msg += `   📈 Разница: *${totalFact - totalDoc}* шт\n`;
-        msg += `   ⚖️ Вес: *${formatNumber(totalTons)} тонн*`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastIncomeDetail = { items, periodName, year, totals: { doc: totalDoc, fact: totalFact, tons: totalTons } };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `exincdet_${periodType}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт детального прихода в Excel
-bot.action(/^exincdet_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastIncomeDetail) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { items, periodName, year, totals } = session.lastIncomeDetail;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Детальный приход');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Вагон', key: 'wagon', width: 15 },
-            { header: 'Фирма', key: 'company', width: 18 },
-            { header: 'Склад', key: 'warehouse', width: 15 },
-            { header: 'Товар', key: 'product', width: 18 },
-            { header: 'По док', key: 'qtyDoc', width: 10 },
-            { header: 'Факт', key: 'qtyFact', width: 10 },
-            { header: 'Разница', key: 'difference', width: 10 },
-            { header: 'Вес (т)', key: 'weightTons', width: 10 },
-            { header: 'Примечания', key: 'notes', width: 25 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FF4CAF50' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        
-        // Данные
-        items.forEach((item, i) => {
-            sheet.addRow({
-                num: i + 1,
-                date: item.date,
-                wagon: item.wagon,
-                company: item.company,
-                warehouse: item.warehouse,
-                product: item.product,
-                qtyDoc: item.qtyDoc,
-                qtyFact: item.qtyFact,
-                difference: item.difference,
-                weightTons: item.weightTons,
-                notes: item.notes
-            });
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            date: '',
-            wagon: '',
-            company: '',
-            warehouse: '',
-            product: 'ИТОГО:',
-            qtyDoc: totals.doc,
-            qtyFact: totals.fact,
-            difference: totals.fact - totals.doc,
-            weightTons: totals.tons,
-            notes: ''
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Сохраняем файл
-        const fileName = `Приход_детальный_${periodName.replace(/\s/g, '_')}_${year}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: fileName },
-            { caption: `📋 Детальный приход\n📅 ${periodName}\n📊 ${items.length} записей\n⚖️ ${formatNumber(totals.tons)} тонн` }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
-});
-
-// Расход за период
-bot.hears(/📉|расход за период/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка...');
-    try {
-        const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.expense || yearData.expense.length === 0) {
-            return ctx.reply(`📉 Нет данных о расходе за ${year} год`);
-        }
-        
-        // Группируем по месяцам
-        const byMonth = {};
-        yearData.expense.filter(item => !item.isDeleted).forEach(item => {
-            const date = new Date(item.date);
-            const month = date.toLocaleString('ru', { month: 'long' });
-            if (!byMonth[month]) byMonth[month] = { count: 0, tons: 0, sum: 0 };
-            byMonth[month].count++;
-            byMonth[month].tons += (item.quantity || 0) / 20;
-            byMonth[month].sum += item.total || 0;
-        });
-        
-        let msg = `📉 *РАСХОД ЗА ${year}*\n${'─'.repeat(20)}\n\n`;
-        let totalTons = 0;
-        let totalSum = 0;
-        let totalCount = 0;
-        
-        Object.entries(byMonth).forEach(([month, data]) => {
-            msg += `📅 *${month}*\n`;
-            msg += `   ${data.count} продаж, ${formatNumber(data.tons)} т\n`;
-            msg += `   💵 ${formatNumber(data.sum)} $\n\n`;
-            totalTons += data.tons;
-            totalSum += data.sum;
-            totalCount += data.count;
-        });
-        
-        msg += `${'─'.repeat(20)}\n`;
-        msg += `📊 Всего: *${totalCount}* продаж\n`;
-        msg += `📦 Итого: *${formatNumber(totalTons)} тонн*\n`;
-        msg += `💰 Сумма: *${formatNumber(totalSum)} $*`;
-        
-        // Кнопка для детального отчёта
-        const detailButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📋 Детальный за период', 'expense_detail_menu')]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...detailButton });
-        } else {
-            ctx.reply(msg, { parse_mode: 'Markdown', ...detailButton });
-        }
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Меню выбора периода для детального расхода
-bot.action('expense_detail_menu', async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.answerCbQuery();
-    
-    const periodButtons = Markup.inlineKeyboard([
-        [Markup.button.callback('📅 Сегодня', 'expdet_today'), Markup.button.callback('📅 Вчера', 'expdet_yesterday')],
-        [Markup.button.callback('📅 Эта неделя', 'expdet_week'), Markup.button.callback('📅 Этот месяц', 'expdet_month')],
-        [Markup.button.callback('📅 Весь год', 'expdet_year')]
-    ]);
-    
-    ctx.reply(
-        `📋 *ДЕТАЛЬНЫЙ РАСХОД*\n📅 Год: *${year}*\n\nВыберите период:`,
-        { parse_mode: 'Markdown', ...periodButtons }
-    );
-});
-
-// Обработка выбора периода для детального расхода
-bot.action(/^expdet_(today|yesterday|week|month|year)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const periodType = ctx.match[1];
-    
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
-    try {
-        const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.expense || yearData.expense.length === 0) {
-            return ctx.reply(`📉 Нет данных о расходе за ${year} год`);
-        }
-        
-        // Определяем период
-        const today = new Date();
-        let dateFrom, dateTo, periodName;
-        
-        switch (periodType) {
-            case 'today':
-                dateFrom = new Date(today.toISOString().split('T')[0]);
-                dateTo = new Date(today.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Сегодня';
-                break;
-            case 'yesterday':
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Вчера';
-                break;
-            case 'week':
-                dateFrom = new Date(today);
-                dateFrom.setDate(dateFrom.getDate() - 7);
-                dateTo = today;
-                periodName = 'За неделю';
-                break;
-            case 'month':
-                dateFrom = new Date(today);
-                dateFrom.setMonth(dateFrom.getMonth() - 1);
-                dateTo = today;
-                periodName = 'За месяц';
-                break;
-            case 'year':
-                dateFrom = null;
-                dateTo = null;
-                periodName = `За ${year} год`;
-                break;
-        }
-        
-        // Фильтруем данные (исключаем удаленные записи)
-        let expense = yearData.expense.filter(item => !item.isDeleted);
-        if (dateFrom && dateTo) {
-            expense = expense.filter(item => {
-                const itemDate = new Date(item.date);
-                return itemDate >= dateFrom && itemDate <= dateTo;
-            });
-        }
-        
-        if (expense.length === 0) {
-            return ctx.reply(`📉 Нет данных о расходе за выбранный период`);
-        }
-        
-        // Формируем данные для отчёта
-        const items = expense.map(item => ({
-            date: item.date || '',
-            client: item.client || '',
-            product: item.product || '',
-            company: item.company || '',
-            warehouse: item.warehouse || '',
-            quantity: parseFloat(item.quantity) || 0,
-            tons: (parseFloat(item.quantity) || 0) / 20,
-            price: parseFloat(item.price) || 0,
-            total: parseFloat(item.total) || 0,
-            notes: item.notes || ''
-        }));
-        
-        // Сортируем по дате (новые сверху)
-        items.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        // Итоги
-        let totalQty = 0, totalTons = 0, totalSum = 0;
-        items.forEach(item => {
-            totalQty += item.quantity;
-            totalTons += item.tons;
-            totalSum += item.total;
-        });
-        
-        let msg = `📋 *ДЕТАЛЬНЫЙ РАСХОД*\n`;
-        msg += `📅 ${periodName}\n`;
-        msg += `${'═'.repeat(25)}\n\n`;
-        
-        // Показываем до 15 записей
-        const showItems = items.slice(0, 15);
-        showItems.forEach((item, i) => {
-            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
-            msg += `${i + 1}. *${formattedDate}*\n`;
-            msg += `   👤 ${item.client}\n`;
-            msg += `   ${item.product} | ${item.warehouse}\n`;
-            msg += `   📦 ${item.quantity} шт | ⚖️ ${formatNumber(item.tons)} т\n`;
-            msg += `   💵 *${formatNumber(item.total)} $*\n\n`;
-        });
-        
-        if (items.length > 15) {
-            msg += `_...и ещё ${items.length - 15} записей_\n\n`;
-        }
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 *ИТОГО:* ${items.length} записей\n`;
-        msg += `   📦 Количество: *${totalQty}* шт\n`;
-        msg += `   ⚖️ Вес: *${formatNumber(totalTons)} тонн*\n`;
-        msg += `   💰 Сумма: *${formatNumber(totalSum)} $*`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastExpenseDetail = { items, periodName, year, totals: { qty: totalQty, tons: totalTons, sum: totalSum } };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `exexpdet_${periodType}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт детального расхода в Excel
-bot.action(/^exexpdet_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastExpenseDetail) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { items, periodName, year, totals } = session.lastExpenseDetail;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Детальный расход');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Клиент', key: 'client', width: 20 },
-            { header: 'Товар', key: 'product', width: 15 },
-            { header: 'Фирма', key: 'company', width: 15 },
-            { header: 'Склад', key: 'warehouse', width: 15 },
-            { header: 'Кол-во', key: 'quantity', width: 10 },
-            { header: 'Тонны', key: 'tons', width: 10 },
-            { header: 'Цена', key: 'price', width: 10 },
-            { header: 'Сумма', key: 'total', width: 12 },
-            { header: 'Примечания', key: 'notes', width: 20 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFFF5722' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        
-        // Данные
-        items.forEach((item, i) => {
-            sheet.addRow({
-                num: i + 1,
-                date: item.date,
-                client: item.client,
-                product: item.product,
-                company: item.company,
-                warehouse: item.warehouse,
-                quantity: item.quantity,
-                tons: item.tons,
-                price: item.price,
-                total: item.total,
-                notes: item.notes
-            });
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            date: '',
-            client: '',
-            product: '',
-            company: '',
-            warehouse: 'ИТОГО:',
-            quantity: totals.qty,
-            tons: totals.tons,
-            price: '',
-            total: totals.sum,
-            notes: ''
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Сохраняем файл
-        const fileName = `Расход_детальный_${periodName.replace(/\s/g, '_')}_${year}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: fileName },
-            { caption: `📋 Детальный расход\n📅 ${periodName}\n📊 ${items.length} записей\n💰 ${formatNumber(totals.sum)} $` }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
-});
-
-// Погашения за период
-bot.hears(/💵|погашения за период/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка...');
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.payments || yearData.payments.length === 0) {
-            return ctx.reply(`� Нет данных о погашениях за ${year} год`);
-        }
-        
-        // Группируем по месяцам
-        const byMonth = {};
-        yearData.payments.filter(item => !item.isDeleted).forEach(item => {
-            const date = new Date(item.date);
-            const month = date.toLocaleString('ru', { month: 'long' });
-            if (!byMonth[month]) byMonth[month] = { count: 0, sum: 0 };
-            byMonth[month].count++;
-            byMonth[month].sum += item.amount || 0;
-        });
-        
-        let msg = `💵 *ПОГАШЕНИЯ ЗА ${year}*\n${'─'.repeat(20)}\n\n`;
-        let totalSum = 0;
-        let totalCount = 0;
-        
-        Object.entries(byMonth).forEach(([month, data]) => {
-            msg += `📅 *${month}*: ${data.count} платежей, ${formatNumber(data.sum)} $\n`;
-            totalSum += data.sum;
-            totalCount += data.count;
-        });
-        
-        msg += `\n${'─'.repeat(20)}\n`;
-        msg += `📊 Всего: *${totalCount}* платежей\n`;
-        msg += `💰 Итого: *${formatNumber(totalSum)} $*`;
-        
-        // Кнопка для детального отчёта
-        const detailButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📋 Детальный за период', 'payments_detail_menu')]
-        ]);
-        
-        ctx.reply(msg, { parse_mode: 'Markdown', ...detailButton });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Меню выбора периода для детальных погашений
-bot.action('payments_detail_menu', async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.answerCbQuery();
-    
-    const periodButtons = Markup.inlineKeyboard([
-        [Markup.button.callback('📅 Сегодня', 'paydet_today'), Markup.button.callback('📅 Вчера', 'paydet_yesterday')],
-        [Markup.button.callback('📅 Эта неделя', 'paydet_week'), Markup.button.callback('📅 Этот месяц', 'paydet_month')],
-        [Markup.button.callback('📅 Весь год', 'paydet_year')]
-    ]);
-    
-    ctx.reply(
-        `📋 *ДЕТАЛЬНЫЕ ПОГАШЕНИЯ*\n📅 Год: *${year}*\n\nВыберите период:`,
-        { parse_mode: 'Markdown', ...periodButtons }
-    );
-});
-
-// Обработка выбора периода для детальных погашений
-bot.action(/^paydet_(today|yesterday|week|month|year)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const periodType = ctx.match[1];
-    
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.payments || yearData.payments.length === 0) {
-            return ctx.reply(`💵 Нет данных о погашениях за ${year} год`);
-        }
-        
-        // Определяем период
-        const today = new Date();
-        let dateFrom, dateTo, periodName;
-        
-        switch (periodType) {
-            case 'today':
-                dateFrom = new Date(today.toISOString().split('T')[0]);
-                dateTo = new Date(today.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Сегодня';
-                break;
-            case 'yesterday':
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Вчера';
-                break;
-            case 'week':
-                dateFrom = new Date(today);
-                dateFrom.setDate(dateFrom.getDate() - 7);
-                dateTo = today;
-                periodName = 'За неделю';
-                break;
-            case 'month':
-                dateFrom = new Date(today);
-                dateFrom.setMonth(dateFrom.getMonth() - 1);
-                dateTo = today;
-                periodName = 'За месяц';
-                break;
-            case 'year':
-                dateFrom = null;
-                dateTo = null;
-                periodName = `За ${year} год`;
-                break;
-        }
-        
-        // Фильтруем данные (исключаем удаленные записи)
-        let payments = yearData.payments.filter(item => !item.isDeleted);
-        if (dateFrom && dateTo) {
-            payments = payments.filter(item => {
-                const itemDate = new Date(item.date);
-                return itemDate >= dateFrom && itemDate <= dateTo;
-            });
-        }
-        
-        if (payments.length === 0) {
-            return ctx.reply(`💵 Нет погашений за выбранный период`);
-        }
-        
-        // Формируем данные для отчёта
-        const items = payments.map(item => ({
-            date: item.date || '',
-            client: item.client || '',
-            amount: parseFloat(item.amount) || 0,
-            notes: item.notes || item.note || '',
-            user: item.user || ''
-        }));
-        
-        // Сортируем по дате (новые сверху)
-        items.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        // Итоги
-        let totalSum = 0;
-        items.forEach(item => {
-            totalSum += item.amount;
-        });
-        
-        // Группируем по клиентам для статистики
-        const byClient = {};
-        items.forEach(item => {
-            if (!byClient[item.client]) byClient[item.client] = 0;
-            byClient[item.client] += item.amount;
-        });
-        
-        let msg = `📋 *ДЕТАЛЬНЫЕ ПОГАШЕНИЯ*\n`;
-        msg += `📅 ${periodName}\n`;
-        msg += `${'═'.repeat(25)}\n\n`;
-        
-        // Показываем до 20 записей
-        const showItems = items.slice(0, 20);
-        showItems.forEach((item, i) => {
-            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
-            msg += `${i + 1}. *${formattedDate}*\n`;
-            msg += `   👤 ${item.client}\n`;
-            msg += `   💵 *${formatNumber(item.amount)} $*\n`;
-            if (item.notes) {
-                msg += `   📝 ${item.notes}\n`;
-            }
-            msg += `\n`;
-        });
-        
-        if (items.length > 20) {
-            msg += `_...и ещё ${items.length - 20} записей_\n\n`;
-        }
-        
-        // Топ клиентов по погашениям
-        const topClients = Object.entries(byClient)
-            .sort((a, b) => b[1] - a[1])
-            .slice(0, 5);
-        
-        if (topClients.length > 0) {
-            msg += `${'─'.repeat(20)}\n`;
-            msg += `👥 *Топ по погашениям:*\n`;
-            topClients.forEach(([client, sum], i) => {
-                msg += `   ${i + 1}. ${client}: *${formatNumber(sum)} $*\n`;
-            });
-            msg += `\n`;
-        }
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 *ИТОГО:* ${items.length} платежей\n`;
-        msg += `💰 Сумма: *${formatNumber(totalSum)} $*`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastPaymentsDetail = { items, periodName, year, totalSum };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `expaydet_${periodType}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт детальных погашений в Excel
-bot.action(/^expaydet_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastPaymentsDetail) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { items, periodName, year, totalSum } = session.lastPaymentsDetail;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Детальные погашения');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Клиент', key: 'client', width: 25 },
-            { header: 'Сумма ($)', key: 'amount', width: 15 },
-            { header: 'Примечания', key: 'notes', width: 30 },
-            { header: 'Пользователь', key: 'user', width: 15 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FF2196F3' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        
-        // Данные
-        let total = 0;
-        items.forEach((item, i) => {
-            sheet.addRow({
-                num: i + 1,
-                date: item.date,
-                client: item.client,
-                amount: item.amount,
-                notes: item.notes,
-                user: item.user
-            });
-            total += item.amount;
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            date: '',
-            client: 'ИТОГО:',
-            amount: total,
-            notes: '',
-            user: ''
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Форматирование колонки суммы
-        sheet.getColumn('amount').numFmt = '#,##0.00';
-        
-        // Сохраняем файл
-        const fileName = `Погашения_детальный_${periodName.replace(/\s/g, '_')}_${year}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: fileName },
-            { caption: `📋 Детальные погашения\n📅 ${periodName}\n📊 ${items.length} платежей\n💰 ${formatNumber(totalSum)} $` }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
-});
-
-// Топ должников
-bot.hears(/👥|топ должников/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка...');
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const debts = calculateDebts(data, year);
-        if (!debts || !Object.keys(debts).length) {
-            return ctx.reply(`✅ Нет должников за ${year} год!`);
-        }
-        
-        // Топ-10 должников
-        const sorted = Object.entries(debts)
-            .sort((a, b) => b[1].debt - a[1].debt)
-            .slice(0, 10);
-        
-        let msg = `👥 *ТОП-10 ДОЛЖНИКОВ*\n📅 ${year}\n${'─'.repeat(20)}\n\n`;
-        let totalDebt = 0;
-        
-        sorted.forEach(([client, d], i) => {
-            const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
-            msg += `${medal} *${client}*\n`;
-            msg += `   💳 Долг: *${formatNumber(d.debt)} $*\n\n`;
-            totalDebt += d.debt;
-        });
-        
-        const allDebts = Object.values(debts).reduce((sum, d) => sum + d.debt, 0);
-        
-        msg += `${'─'.repeat(20)}\n`;
-        msg += `💰 Топ-10: *${formatNumber(totalDebt)} $*\n`;
-        msg += `💰 Всего долгов: *${formatNumber(allDebts)} $*`;
-        
-        ctx.reply(msg, { parse_mode: 'Markdown' });
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Итоги вагонов
-bot.hears(/🚂|итоги вагонов/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка итогов вагонов...');
-    try {
-        console.log(`🚂 Запрос итогов вагонов для пользователя ${userId}, год ${year}`);
-        
-        const rawData = await getData();
-        if (!rawData) {
-            console.log('❌ rawData is null');
-            return ctx.reply('❌ Не удалось получить данные');
-        }
-        
-        console.log('📡 Данные получены, ключи:', Object.keys(rawData));
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
-        console.log('🔍 Данные отфильтрованы');
-        
-        if (!data.years || !data.years[year]) {
-            console.log(`❌ Нет данных за год ${year}`);
-            return ctx.reply(`🚂 Нет данных за ${year} год`);
-        }
-        
-        if (!data.years[year].income) {
-            console.log(`❌ Нет данных о приходе за год ${year}`);
-            return ctx.reply(`🚂 Нет данных о приходе за ${year} год`);
-        }
-        
-        console.log(`📦 Записей прихода за ${year}: ${data.years[year].income.length}`);
-        const activeIncome = data.years[year].income.filter(item => !item.isDeleted);
-        console.log(`📦 Активных записей прихода: ${activeIncome.length}`);
-        
-        const wagonTotals = calculateWagonTotals(data, year);
-        
-        if (!wagonTotals) {
-            console.log('❌ calculateWagonTotals returned null');
-            return ctx.reply(`🚂 Ошибка расчета итогов вагонов за ${year} год`);
-        }
-        
-        if (wagonTotals.items.length === 0) {
-            console.log('❌ wagonTotals.items is empty');
-            return ctx.reply(`🚂 Нет данных о вагонах за ${year} год`);
-        }
-        
-        console.log(`✅ Найдено позиций: ${wagonTotals.items.length}`);
-
-        let msg = `🚂 *ИТОГИ ВАГОНОВ*\n📅 ${year}\n${'═'.repeat(25)}\n\n`;
-        
-        // Группируем по складам
-        const byWarehouse = {};
-        wagonTotals.items.forEach(item => {
-            if (!byWarehouse[item.warehouse]) {
-                byWarehouse[item.warehouse] = [];
-            }
-            byWarehouse[item.warehouse].push(item);
-        });
-        
-        Object.entries(byWarehouse).sort().forEach(([warehouse, items]) => {
-            msg += `🏪 *${escapeMarkdown(warehouse)}*\n`;
-            msg += `${'─'.repeat(20)}\n`;
-            
-            let whWagons = 0, whDoc = 0, whFact = 0, whTons = 0;
-            
-            items.forEach(item => {
-                msg += `📦 ${escapeMarkdown(item.product)} (${escapeMarkdown(item.company)})\n`;
-                msg += `   🚂 Вагонов: ${item.wagons}\n`;
-                msg += `   📄 По док: ${item.qtyDoc} шт\n`;
-                msg += `   ✅ Факт: ${item.qtyFact} шт\n`;
-                const diff = item.qtyFact - item.qtyDoc;
-                const diffIcon = diff >= 0 ? '📈' : '📉';
-                msg += `   ${diffIcon} Разница: ${diff} шт\n`;
-                msg += `   ⚖️ Вес: ${formatNumber(item.weightTons)} т\n\n`;
-                
-                whWagons += item.wagons;
-                whDoc += item.qtyDoc;
-                whFact += item.qtyFact;
-                whTons += item.weightTons;
-            });
-            
-            msg += `📊 *Итого ${escapeMarkdown(warehouse)}:*\n`;
-            msg += `   🚂 ${whWagons} вагонов, ⚖️ ${formatNumber(whTons)} т\n\n`;
-        });
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `🚂 *ОБЩИЙ ИТОГ:*\n`;
-        msg += `   Вагонов: *${wagonTotals.totals.wagons}*\n`;
-        msg += `   По документам: *${wagonTotals.totals.qtyDoc}* шт\n`;
-        msg += `   Фактически: *${wagonTotals.totals.qtyFact}* шт\n`;
-        msg += `   Разница: *${wagonTotals.totals.difference}* шт\n`;
-        msg += `   Вес: *${formatNumber(wagonTotals.totals.weightTons)} тонн*`;
-        
-        console.log(`📤 Отправляем сообщение длиной ${msg.length} символов`);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (const part of parts) {
-                await sendMarkdownMessage(ctx, part);
-            }
-        } else {
-            await sendMarkdownMessage(ctx, msg);
-        }
-    } catch (e) {
-        console.error('❌ Ошибка в итогах вагонов:', e);
-        console.error('Stack trace:', e.stack);
-        ctx.reply(`❌ Ошибка загрузки данных: ${e.message}`);
-    }
-});
-
-// Расход по клиентам - выбор периода
-bot.hears(/🛒|расход по клиентам/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    // Показываем кнопки выбора периода
-    const periodButtons = Markup.inlineKeyboard([
-        [Markup.button.callback('📅 Сегодня', 'cexp_today')],
-        [Markup.button.callback('📅 Вчера', 'cexp_yesterday')],
-        [Markup.button.callback('📅 Эта неделя', 'cexp_week')],
-        [Markup.button.callback('📅 Этот месяц', 'cexp_month')],
-        [Markup.button.callback('📅 Весь год', 'cexp_year')]
-    ]);
-    
-    ctx.reply(
-        `🛒 *РАСХОД ПО КЛИЕНТАМ*\n📅 Год: *${year}*\n\nВыберите период:`,
-        { parse_mode: 'Markdown', ...periodButtons }
-    );
-});
-
-// Обработка выбора периода для расхода по клиентам
-bot.action(/^cexp_(today|yesterday|week|month|year)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const period = ctx.match[1];
-    
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        // Определяем даты периода
-        const today = new Date();
-        let dateFrom, dateTo;
-        let periodName;
-        
-        switch (period) {
-            case 'today':
-                dateFrom = new Date(today.getFullYear(), today.getMonth(), today.getDate());
-                dateTo = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59);
-                periodName = 'Сегодня';
-                break;
-            case 'yesterday':
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                dateFrom = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate());
-                dateTo = new Date(yesterday.getFullYear(), yesterday.getMonth(), yesterday.getDate(), 23, 59, 59);
-                periodName = 'Вчера';
-                break;
-            case 'week':
-                const weekStart = new Date(today);
-                weekStart.setDate(weekStart.getDate() - weekStart.getDay() + 1);
-                dateFrom = new Date(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate());
-                dateTo = today;
-                periodName = 'Эта неделя';
-                break;
-            case 'month':
-                dateFrom = new Date(today.getFullYear(), today.getMonth(), 1);
-                dateTo = today;
-                periodName = 'Этот месяц';
-                break;
-            case 'year':
-                dateFrom = new Date(parseInt(year), 0, 1);
-                dateTo = new Date(parseInt(year), 11, 31, 23, 59, 59);
-                periodName = `Весь ${year} год`;
-                break;
-        }
-        
-        const reportData = calculateClientExpense(data, year, dateFrom, dateTo);
-        
-        if (!reportData || reportData.items.length === 0) {
-            return ctx.reply(`🛒 Нет данных о расходах за период: ${periodName}`);
-        }
-        
-        // Формируем сообщение
-        let msg = `🛒 *РАСХОД ПО КЛИЕНТАМ*\n📅 ${periodName}\n${'═'.repeat(25)}\n\n`;
-        
-        // Группируем по клиентам
-        const byClient = {};
-        reportData.items.forEach(item => {
-            if (!byClient[item.client]) {
-                byClient[item.client] = { items: [], totalQty: 0, totalTons: 0, totalSum: 0 };
-            }
-            byClient[item.client].items.push(item);
-            byClient[item.client].totalQty += item.quantity || 0;
-            byClient[item.client].totalTons += item.tons || 0;
-            byClient[item.client].totalSum += item.total || 0;
-        });
-        
-        // Сортируем по сумме
-        const sortedClients = Object.entries(byClient).sort((a, b) => b[1].totalSum - a[1].totalSum);
-        
-        sortedClients.forEach(([client, data]) => {
-            msg += `👤 *${client}*\n`;
-            msg += `   📦 ${data.totalQty} шт (${formatNumber(data.totalTons)} т)\n`;
-            msg += `   💵 *${formatNumber(data.totalSum)} $*\n\n`;
-        });
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 *ИТОГО:*\n`;
-        msg += `   📦 Количество: *${reportData.totals.quantity} шт*\n`;
-        msg += `   ⚖️ Вес: *${formatNumber(reportData.totals.tons)} т*\n`;
-        msg += `   💰 Сумма: *${formatNumber(reportData.totals.sum)} $*\n`;
-        msg += `   👥 Клиентов: *${sortedClients.length}*`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastClientExpense = { reportData, periodName, year };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `excexp_${period}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт расхода по клиентам в Excel
-bot.action(/^excexp_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastClientExpense) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { reportData, periodName, year } = session.lastClientExpense;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Расход по клиентам');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Клиент', key: 'client', width: 20 },
-            { header: 'Товар', key: 'product', width: 15 },
-            { header: 'Фирма', key: 'company', width: 15 },
-            { header: 'Склад', key: 'warehouse', width: 15 },
-            { header: 'Кол-во', key: 'quantity', width: 10 },
-            { header: 'Тонны', key: 'tons', width: 10 },
-            { header: 'Цена', key: 'price', width: 10 },
-            { header: 'Сумма', key: 'total', width: 12 },
-            { header: 'Примечания', key: 'notes', width: 20 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFE0E0E0' }
-        };
-        
-        // Данные
-        reportData.items.forEach((item, i) => {
-            sheet.addRow({
-                num: i + 1,
-                date: item.date,
-                client: item.client,
-                product: item.product,
-                company: item.company,
-                warehouse: item.warehouse,
-                quantity: item.quantity,
-                tons: item.tons,
-                price: item.price,
-                total: item.total,
-                notes: item.notes || ''
-            });
-        });
-        
-        // Итоговая строка
-        const lastRow = sheet.addRow({
-            num: '',
-            date: '',
-            client: '',
-            product: '',
-            company: '',
-            warehouse: 'ИТОГО:',
-            quantity: reportData.totals.quantity,
-            tons: reportData.totals.tons,
-            price: '',
-            total: reportData.totals.sum,
-            notes: ''
-        });
-        lastRow.font = { bold: true };
-        lastRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFFFF0B3' }
-        };
-        
-        // Сохраняем файл
-        const fileName = `Расход_по_клиентам_${periodName.replace(/\s/g, '_')}_${year}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument({ source: filePath, filename: fileName });
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
-});
-
-// Приход товаров - выбор периода
-bot.hears(/� Приход товаров/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    ctx.reply(
-        `📦 *ПРИХОД ТОВАРОВ*\n📅 Год: *${year}*\n\nВыберите период:`,
+      const keyboard = [
+        [{ text: `✅ Одобрить ${userName}`, callback_data: `approve_${userId}` }],
+        [{ text: `❌ Отклонить ${userName}`, callback_data: `reject_${userId}` }]
+      ];
+      
+      await bot.telegram.sendMessage(
+        adminId,
+        '🔔 Новый запрос на регистрацию!\n\n' +
+        `👤 Имя: ${userName}\n` +
+        `🆔 Telegram ID: ${userId}\n` +
+        `📱 Username: @${ctx.from.username || 'не указан'}\n\n` +
+        'Одобрить регистрацию?',
         {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('📅 Сегодня', 'incp_today'), Markup.button.callback('📅 Вчера', 'incp_yesterday')],
-                [Markup.button.callback('📅 Неделя', 'incp_week'), Markup.button.callback('📅 Месяц', 'incp_month')],
-                [Markup.button.callback('📅 Весь год', 'incp_year')]
-            ])
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: '✅ Одобрить', callback_data: `approve_${userId}` },
+                { text: '❌ Отклонить', callback_data: `reject_${userId}` }
+              ]
+            ]
+          }
         }
-    );
+      );
+    } catch (error) {
+      console.error('Ошибка отправки уведомления админу:', error);
+    }
+  }
 });
 
-// Обработка выбора периода для прихода товаров
-bot.action(/^incp_(today|yesterday|week|month|year)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const periodType = ctx.match[1];
-    
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
+// Обработка кнопок для администратора
+bot.hears('📦 Создать заявку', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  if (!admin.isAdmin(userId)) {
+    return;
+  }
+  
+  // Начинаем процесс создания заявки
+  orderData.set(userId, { items: [], step: 'warehouse', createdAt: Date.now() });
+  
+  // 🔄 Всегда загружаем свежие данные складов из БД
+  console.log('🔄 Обновление списка складов из БД...');
+  await reloadWarehousesAndProducts();
+  
+  const keyboard = getWarehouses().map(w => [{ text: w }]);
+  
+  ctx.reply(
+    '📦 Создание новой заявки\n\n' +
+    '🏬 Выберите склад:',
+    { reply_markup: { keyboard, resize_keyboard: true, one_time_keyboard: true } }
+  );
+});
+
+// Обработка кнопки "🏬 Склад" - начало создания заявки
+bot.hears('🏬 Склад', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  const isAdminUser = admin.isAdmin(userId);
+  const isClientUser = await database.isClient(userId);
+  
+  if (!isAdminUser && !isClientUser) {
+    return;
+  }
+  
+  // Начинаем процесс создания заявки
+  orderData.set(userId, { items: [], step: 'warehouse', createdAt: Date.now() });
+  
+  // 🔄 Всегда загружаем свежие данные складов из БД
+  console.log('🔄 Обновление списка складов из БД...');
+  await reloadWarehousesAndProducts();
+  
+  const keyboard = getWarehouses().map(w => [{ text: w }]);
+  
+  ctx.reply(
+    '🏬 Выберите склад:',
+    { reply_markup: { keyboard, resize_keyboard: true, one_time_keyboard: true } }
+  );
+});
+
+bot.hears('👨‍💼 Панель администратора', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  if (!admin.isAdmin(userId)) {
+    return ctx.reply('❌ У вас нет прав администратора');
+  }
+  
+  const keyboard = [
+    [{ text: '👥 Управление клиентами' }],
+    [{ text: '📋 Список клиентов' }],
+    [{ text: '✏️ Изменить данные клиента' }],
+    [{ text: '🚫 Заблокировать клиента' }],
+    [{ text: '🏬 Управление складами' }],
+    [{ text: '🛒 Управление товарами' }],
+    [{ text: '💰 Касса' }],
+    [{ text: '📊 Статистика' }],
+    [{ text: '🔙 Назад' }]
+  ];
+  
+  ctx.reply(
+    '👨‍💼 Панель администратора\n\n' +
+    'Выберите действие:',
+    { reply_markup: { keyboard, resize_keyboard: true } }
+  );
+});
+
+bot.hears('🔙 Назад', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  if (!admin.isAdmin(userId)) {
+    return;
+  }
+  
+  const keyboard = [
+    [{ text: '📦 Создать заявку' }],
+    [{ text: '👨‍💼 Панель администратора' }]
+  ];
+  
+  ctx.reply(
+    'Главное меню:',
+    { reply_markup: { keyboard, resize_keyboard: true } }
+  );
+});
+
+// ============================================================
+// 💰 КАССА — инкассо кассиру через WhatsApp
+// ============================================================
+
+bot.hears('💰 Касса', async (ctx) => {
+  const userId = ctx.from.id;
+  if (!admin.isAdmin(userId)) return;
+
+  orderData.set(userId, { step: 'cash_search', createdAt: Date.now() });
+
+  ctx.reply(
+    '💰 Касса — Инкассо\n\n🔍 Введите имя или телефон клиента:',
+    { reply_markup: { remove_keyboard: true } }
+  );
+});
+
+
+// Вспомогательная функция: формирует и показывает шаблон инкассо
+async function buildCashMessage(ctx, userId, data) {
+  const client = data.cashClient;
+  const lines = [
+    '💰 ИНКАССО',
+    '',
+    '👤 Клиент: ' + client.name,
+    '📞 Телефон: ' + (client.phone || 'не указан')
+  ];
+
+  if (data.cashMode === 'usd') {
+    lines.push('💵 Доллар: $' + data.cashUsd.toLocaleString('ru-RU'));
+  }
+
+  if (data.cashMode === 'somoni') {
+    lines.push('💴 Сомони: ' + data.cashSomoni.toLocaleString('ru-RU') + ' сом');
+    lines.push('📈 Курс: ' + data.cashRate.toLocaleString('ru-RU'));
+    const equiv = (data.cashSomoni / data.cashRate).toFixed(2);
+    lines.push('💵 Эквивалент: $' + parseFloat(equiv).toLocaleString('ru-RU'));
+  }
+
+  if (data.cashMode === 'both') {
+    lines.push('💵 Доллар: $' + data.cashUsd.toLocaleString('ru-RU'));
+    lines.push('💴 Сомони: ' + data.cashSomoni.toLocaleString('ru-RU') + ' сом');
+    lines.push('📈 Курс: ' + data.cashRate.toLocaleString('ru-RU'));
+    const totalSomoni = Math.round(data.cashUsd * data.cashRate) + data.cashSomoni;
+    lines.push('💰 Итого в сомони: ' + totalSomoni.toLocaleString('ru-RU') + ' сом');
+  }
+
+  lines.push('📅 ' + new Date().toLocaleDateString('ru-RU'));
+
+  const cashMessage = lines.join('\n');
+  data.cashMessage = cashMessage;
+  data.step = 'cash_confirm';
+  orderData.set(userId, data);
+
+  const cashierPhone = process.env.CASHIER_WHATSAPP_PHONE || process.env.WHATSAPP_RECIPIENT;
+
+  return ctx.reply(
+    '📋 Шаблон сообщения кассиру:\n\n' + cashMessage + '\n\n' +
+    '📱 Кассир: ' + (cashierPhone || '❌ не настроен') + '\n\nОтправить?',
+    {
+      reply_markup: {
+        inline_keyboard: [[
+          { text: '✅ Отправить кассиру', callback_data: 'cash_send' },
+          { text: '❌ Отмена', callback_data: 'cash_cancel' }
+        ]]
+      }
+    }
+  );
+}
+
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id;
+  const text = ctx.message.text;
+  
+  // Игнорируем команды (они обрабатываются отдельно)
+  if (text.startsWith('/')) {
+    return;
+  }
+  
+  // Проверка прав доступа
+  const isAdminUser = admin.isAdmin(userId);
+  const isClientUser = await database.isClient(userId);
+  
+  if (!isAdminUser && !isClientUser) {
+    return; // Игнорируем сообщения от неавторизованных пользователей
+  }
+  
+  const data = orderData.get(userId) || { items: [], step: 'name' };
+
+  try {
+    // ── Касса: поиск клиента ──
+    if (data.step === 'cash_search' && isAdminUser) {
+      const query = text.trim().toLowerCase();
+      if (query.length < 2) {
+        return ctx.reply('⚠️ Введите минимум 2 символа');
+      }
+      const allClients = await database.getAllClients();
+      const found = allClients.filter(c =>
+        (c.name || '').toLowerCase().includes(query) ||
+        (c.phone || '').toLowerCase().includes(query)
+      ).slice(0, 10);
+
+      if (found.length === 0) {
+        return ctx.reply(`❌ Клиент не найден: "${text}"\n\nПопробуйте ещё раз:`);
+      }
+
+      data.step = 'cash_select_client';
+      data.cashFoundClients = found;
+      orderData.set(userId, data);
+
+      const inlineKeyboard = found.map(c => [{
+        text: `${c.name} (${c.phone || 'без тел.'})`,
+        callback_data: `cash_client_${c.telegram_id}`
+      }]);
+
+      return ctx.reply('👤 Выберите клиента:', {
+        reply_markup: { inline_keyboard: inlineKeyboard }
+      });
+    }
+
+    // ── Касса: ввод суммы (доллар) ──
+    if (data.step === 'cash_enter_usd' && isAdminUser) {
+      const amount = text.trim().replace(',', '.');
+      if (!/^\d+(\.\d+)?$/.test(amount)) {
+        return ctx.reply('⚠️ Введите сумму числом (например: 500)');
+      }
+      data.cashUsd = parseFloat(amount);
+      if (data.cashMode === 'usd') {
+        return buildCashMessage(ctx, userId, data);
+      }
+      data.step = 'cash_enter_somoni';
+      orderData.set(userId, data);
+      return ctx.reply(`💵 Доллар: $${data.cashUsd.toLocaleString('ru-RU')}\n\n💴 Введите сумму в сомони:`);
+    }
+
+    // ── Касса: ввод суммы (сомони) ──
+    if (data.step === 'cash_enter_somoni' && isAdminUser) {
+      const amount = text.trim().replace(',', '.');
+      if (!/^\d+(\.\d+)?$/.test(amount)) {
+        return ctx.reply('⚠️ Введите сумму числом (например: 5000)');
+      }
+      data.cashSomoni = parseFloat(amount);
+      data.step = 'cash_enter_rate';
+      orderData.set(userId, data);
+      return ctx.reply(`💴 Сомони: ${data.cashSomoni.toLocaleString('ru-RU')} сом\n\n📈 Введите курс доллара (сомони за $1):`);
+    }
+
+    // ── Касса: ввод курса (после сомони) ──
+    if (data.step === 'cash_enter_rate' && isAdminUser) {
+      const rate = text.trim().replace(',', '.');
+      if (!/^\d+(\.\d+)?$/.test(rate)) {
+        return ctx.reply('⚠️ Введите курс числом (например: 10900)');
+      }
+      data.cashRate = parseFloat(rate);
+      return buildCashMessage(ctx, userId, data);
+    }
+    // Обработка поиска клиента (только для администраторов)
+    if (data.step === 'search_client' && isAdminUser) {
+      const searchQuery = text.trim().toLowerCase();
+      
+      if (searchQuery.length < 2) {
+        return ctx.reply('⚠️ Введите минимум 2 символа для поиска');
+      }
+      
+      try {
+        // Всегда загружаем свежий список из БД
+        const allClients = await database.getAllClients();
         
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.income || yearData.income.length === 0) {
-            return ctx.reply(`📦 Нет данных о приходе за ${year} год`);
+        if (allClients.length === 0) {
+          return ctx.reply('❌ В системе нет зарегистрированных клиентов.\nСначала добавьте клиентов через панель администратора.');
         }
         
-        // Определяем период
-        const today = new Date();
-        let dateFrom, dateTo, periodName;
-        
-        switch (periodType) {
-            case 'today':
-                dateFrom = new Date(today.toISOString().split('T')[0]);
-                dateTo = new Date(today.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Сегодня';
-                break;
-            case 'yesterday':
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                dateFrom = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo = new Date(yesterday.toISOString().split('T')[0]);
-                dateTo.setHours(23, 59, 59);
-                periodName = 'Вчера';
-                break;
-            case 'week':
-                dateFrom = new Date(today);
-                dateFrom.setDate(dateFrom.getDate() - 7);
-                dateTo = today;
-                periodName = 'За неделю';
-                break;
-            case 'month':
-                dateFrom = new Date(today);
-                dateFrom.setMonth(dateFrom.getMonth() - 1);
-                dateTo = today;
-                periodName = 'За месяц';
-                break;
-            case 'year':
-                dateFrom = null;
-                dateTo = null;
-                periodName = `За ${year} год`;
-                break;
-        }
-        
-        // Фильтруем данные
-        let income = yearData.income;
-        if (dateFrom && dateTo) {
-            income = income.filter(item => {
-                const itemDate = new Date(item.date);
-                return itemDate >= dateFrom && itemDate <= dateTo;
-            });
-        }
-        
-        if (income.length === 0) {
-            return ctx.reply(`📦 Нет данных о приходе за выбранный период`);
-        }
-        
-        // Формируем данные для отчёта
-        const items = income.map(item => ({
-            date: item.date || '',
-            wagon: item.wagon || '',
-            company: item.company || '',
-            warehouse: item.warehouse || '',
-            product: item.product || '',
-            qtyDoc: parseFloat(item.qtyDoc) || 0,
-            qtyFact: parseFloat(item.qtyFact) || 0,
-            difference: (parseFloat(item.qtyFact) || 0) - (parseFloat(item.qtyDoc) || 0),
-            weightTons: (parseFloat(item.qtyFact) || 0) / 20,
-            notes: item.notes || ''
-        }));
-        
-        // Сортируем по дате (новые сверху)
-        items.sort((a, b) => new Date(b.date) - new Date(a.date));
-        
-        // Итоги
-        let totalDoc = 0, totalFact = 0, totalTons = 0;
-        items.forEach(item => {
-            totalDoc += item.qtyDoc;
-            totalFact += item.qtyFact;
-            totalTons += item.weightTons;
+        // Фильтруем клиентов по поисковому запросу
+        const foundClients = allClients.filter(client => {
+          const clientName = (client.name || '').toLowerCase();
+          const clientPhone = (client.phone || '').toLowerCase();
+          return clientName.includes(searchQuery) || clientPhone.includes(searchQuery);
         });
         
-        let msg = `📦 *ПРИХОД ТОВАРОВ*\n`;
-        msg += `📅 ${periodName}\n`;
-        msg += `${'═'.repeat(25)}\n\n`;
-        
-        // Показываем до 15 записей
-        const showItems = items.slice(0, 15);
-        showItems.forEach((item, i) => {
-            const formattedDate = new Date(item.date).toLocaleDateString('ru-RU');
-            msg += `${i + 1}. *${formattedDate}*\n`;
-            msg += `   🚂 ${item.wagon} | ${item.product}\n`;
-            msg += `   ${item.company} → ${item.warehouse}\n`;
-            msg += `   📄 ${item.qtyDoc} | ✅ ${item.qtyFact} | ⚖️ ${formatNumber(item.weightTons)} т\n\n`;
-        });
-        
-        if (items.length > 15) {
-            msg += `_...и ещё ${items.length - 15} записей_\n\n`;
+        if (foundClients.length === 0) {
+          return ctx.reply(
+            `❌ Клиенты не найдены по запросу: "${text}"\n\n` +
+            'Попробуйте ввести другое имя или часть имени:'
+          );
         }
         
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 *ИТОГО:* ${items.length} записей\n`;
-        msg += `   📄 По док: *${totalDoc}* шт\n`;
-        msg += `   ✅ Факт: *${totalFact}* шт\n`;
-        msg += `   📈 Разница: *${totalFact - totalDoc}* шт\n`;
-        msg += `   ⚖️ Вес: *${formatNumber(totalTons)} тонн*`;
+        // Ограничиваем количество результатов до 10
+        const limitedClients = foundClients.slice(0, 10);
         
-        // Сохраняем данные для экспорта
-        sessions[userId].lastIncomeProducts = { items, periodName, year, totals: { doc: totalDoc, fact: totalFact, tons: totalTons } };
-        saveSessions();
+        // Создаем inline-клавиатуру с найденными клиентами
+        const inlineKeyboard = limitedClients.map(client => [{
+          text: `${client.name || 'Без имени'} (${client.phone || 'Без телефона'})`,
+          callback_data: `select_client_${client.telegram_id}`
+        }]);
         
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `exincp_${periodType}`)]
-        ]);
+        // Сохраняем список найденных клиентов (свежий из БД)
+        data.step = 'select_client';
+        data.clientsList = limitedClients;
+        orderData.set(userId, data);
         
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
+        let message = `🔍 Найдено клиентов: ${foundClients.length}`;
+        if (foundClients.length > 10) {
+          message += ` (показаны первые 10)`;
+        }
+        message += '\n\n👤 Выберите клиента:';
+        
+        return ctx.reply(message, {
+          reply_markup: { inline_keyboard: inlineKeyboard }
+        });
+      } catch (error) {
+        console.error('Ошибка поиска клиентов:', error);
+        return ctx.reply('❌ Ошибка при поиске клиентов');
+      }
+    }
+    
+    // Обработка редактирования профиля
+    if (data.editingProfile === 'name') {
+      const newName = text.trim();
+      
+      try {
+        const client = await database.getClient(userId);
+        await database.updateClient(userId, newName, client.phone);
+        
+        delete data.editingProfile;
+        orderData.delete(userId);
+        
+        const keyboard = isAdminUser 
+          ? [[{ text: '📦 Создать заявку' }], [{ text: '👨‍💼 Панель администратора' }]]
+          : [[{ text: '🏬 Склад' }]];
+        
+        return ctx.reply(
+          `✅ Имя успешно изменено на: ${newName}`,
+          { reply_markup: { keyboard, resize_keyboard: true } }
+        );
+      } catch (error) {
+        console.error('Ошибка обновления имени:', error);
+        return ctx.reply('❌ Ошибка при обновлении имени');
+      }
+    }
+    
+    if (data.editingProfile === 'phone') {
+      const newPhone = text.trim();
+      
+      try {
+        const client = await database.getClient(userId);
+        await database.updateClient(userId, client.name, newPhone);
+        
+        delete data.editingProfile;
+        orderData.delete(userId);
+        
+        const keyboard = isAdminUser 
+          ? [[{ text: '📦 Создать заявку' }], [{ text: '👨‍💼 Панель администратора' }]]
+          : [[{ text: '🏬 Склад' }]];
+        
+        return ctx.reply(
+          `✅ Телефон успешно изменен на: ${newPhone}`,
+          { reply_markup: { keyboard, resize_keyboard: true } }
+        );
+      } catch (error) {
+        console.error('Ошибка обновления телефона:', error);
+        return ctx.reply('❌ Ошибка при обновлении телефона');
+      }
+    }
+    
+    // Шаг 1: Выбор склада
+    if (data.step === 'warehouse' && getWarehouses().includes(text)) {
+      data.warehouse = text;
+      data.step = 'product';
+      orderData.set(userId, data);
+      
+      // 🔄 Обновляем товары из БД перед показом
+      console.log('🔄 Обновление списка товаров из БД...');
+      await loadWarehousesAndProducts();
+      
+      const keyboard = getProducts().map(p => [{ text: p }]);
+      
+      return ctx.reply(
+        `✅ Склад: ${text}\n\n🛒 Выберите товар:`,
+        { reply_markup: { keyboard, resize_keyboard: true, one_time_keyboard: true } }
+      );
+    }
+
+    // Шаг 2: Выбор товара
+    if (data.step === 'product' && getProducts().includes(text)) {
+      data.currentProduct = text;
+      data.step = 'quantity';
+      orderData.set(userId, data);
+      
+      return ctx.reply(
+        `📦 Товар: ${text}\n\n` +
+        'Введите количество (только число):\n(например: 200)',
+        { reply_markup: { remove_keyboard: true } }
+      );
+    }
+
+    // Шаг 3: Количество товара
+    if (data.step === 'quantity') {
+      // Проверяем, что введено число
+      const quantity = text.trim();
+      
+      data.items = data.items || [];
+      data.items.push({
+        product: data.currentProduct,
+        quantity: quantity + ' шт'  // Автоматически добавляем "шт"
+      });
+      delete data.currentProduct;
+      
+      // Спрашиваем, нужно ли добавить еще товары
+      data.step = 'add_more';
+      orderData.set(userId, data);
+      
+      const keyboard = [
+        [{ text: '➕ Добавить еще товар' }],
+        [{ text: '✅ Продолжить' }]
+      ];
+      
+      let message = '✅ Товар добавлен!\n\n';
+      message += `🏬 Склад: ${data.warehouse}\n\n`;
+      message += 'Товары:\n';
+      data.items.forEach((item, i) => {
+        message += `${i + 1}. ${item.product} — ${item.quantity}\n`;
+      });
+      message += '\nЧто дальше?';
+      
+      return ctx.reply(message, {
+        reply_markup: { keyboard, resize_keyboard: true }
+      });
+    }
+
+    // Шаг 4: Добавить еще товар или продолжить
+    if (data.step === 'add_more') {
+      if (text === '➕ Добавить еще товар') {
+        data.step = 'product';
+        orderData.set(userId, data);
+        
+        // 🔄 Обновляем товары из БД перед показом
+        console.log('🔄 Обновление списка товаров из БД...');
+        await loadWarehousesAndProducts();
+        
+        const keyboard = getProducts().map(p => [{ text: p }]);
+        
+        return ctx.reply(
+          '🛒 Выберите товар:',
+          { reply_markup: { keyboard, resize_keyboard: true, one_time_keyboard: true } }
+        );
+      }
+      
+      if (text === '✅ Продолжить') {
+        // Для администратора запрашиваем поиск клиента
+        if (isAdminUser) {
+          data.step = 'search_client';
+          orderData.set(userId, data);
+          
+          let summary = '📋 Ваша заявка:\n\n';
+          summary += `🏬 Склад: ${data.warehouse}\n\n`;
+          summary += 'Товары:\n';
+          data.items.forEach((item, i) => {
+            summary += `${i + 1}. ${item.product} — ${item.quantity}\n`;
+          });
+          summary += '\n🔍 Введите имя клиента или часть имени для поиска:\n';
+          summary += '(например: Иван или Ива)';
+          
+          return ctx.reply(summary, { reply_markup: { remove_keyboard: true } });
+        }
+        
+        // Для обычного клиента - проверяем сохраненные данные
+        const client = await database.getClient(userId);
+        
+        if (client && client.name && client.phone && client.name.trim() !== '' && client.phone.trim() !== '') {
+          // Данные уже есть и заполнены - сразу запрашиваем транспорт
+          data.name = client.name;
+          data.phone = client.phone;
+          data.step = 'transport';
+          orderData.set(userId, data);
+          
+          let summary = '📋 Ваша заявка:\n\n';
+          summary += `👤 Имя: ${client.name}\n`;
+          summary += `📞 Телефон: ${client.phone}\n`;
+          summary += `🏬 Склад: ${data.warehouse}\n\n`;
+          summary += 'Товары:\n';
+          data.items.forEach((item, i) => {
+            summary += `${i + 1}. ${item.product} — ${item.quantity}\n`;
+          });
+          summary += '\n🚚 Введите номер транспорта:\n(например: 1234 AB)';
+          
+          return ctx.reply(summary, { reply_markup: { remove_keyboard: true } });
         } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
+          // Данные не заполнены или клиент новый - запрашиваем имя и телефон
+          data.step = 'name';
+          orderData.set(userId, data);
+          
+          let summary = '📋 Ваша заявка:\n\n';
+          summary += `🏬 Склад: ${data.warehouse}\n\n`;
+          summary += 'Товары:\n';
+          data.items.forEach((item, i) => {
+            summary += `${i + 1}. ${item.product} — ${item.quantity}\n`;
+          });
+          
+          if (client && client.name && client.name.trim() !== '') {
+            summary += '\n📝 Обновите ваши контактные данные:\n\n';
+            summary += `Ваше текущее имя: ${client.name}\n`;
+            summary += 'Введите новое имя или отправьте "-" чтобы оставить текущее:';
+          } else {
+            summary += '\n📝 Заполните контактные данные:\n\n';
+            summary += 'Введите ваше имя:';
+          }
+          
+          return ctx.reply(summary, { reply_markup: { remove_keyboard: true } });
+        }
+      }
+    }
+
+    // Шаг 5: Имя (если первый раз или обновление)
+    if (data.step === 'name') {
+      let finalName = text;
+      
+      // Если пользователь отправил "-", используем существующее имя
+      if (text === '-') {
+        const client = await database.getClient(userId);
+        if (client && client.name && client.name.trim() !== '') {
+          finalName = client.name;
+        } else {
+          return ctx.reply('❌ У вас нет сохраненного имени. Введите ваше имя:');
+        }
+      }
+      
+      data.name = finalName;
+      data.step = 'phone';
+      orderData.set(userId, data);
+      
+      // Проверяем, есть ли сохраненный телефон
+      const client = await database.getClient(userId);
+      if (client && client.phone && client.phone.trim() !== '') {
+        return ctx.reply(
+          `📞 Ваш текущий телефон: ${client.phone}\n\n` +
+          'Введите новый номер телефона или отправьте "-" чтобы оставить текущий:\n' +
+          '(например: +992900000000)'
+        );
+      } else {
+        return ctx.reply('📞 Введите ваш номер телефона:\n(например: +992900000000)');
+      }
+    }
+
+    // Шаг 6: Телефон (если первый раз или обновление)
+    if (data.step === 'phone') {
+      let finalPhone = text;
+      
+      // Если пользователь отправил "-", используем существующий телефон
+      if (text === '-') {
+        const client = await database.getClient(userId);
+        if (client && client.phone && client.phone.trim() !== '') {
+          finalPhone = client.phone;
+        } else {
+          return ctx.reply('❌ У вас нет сохраненного телефона. Введите ваш номер телефона:');
+        }
+      }
+      
+      data.phone = finalPhone;
+      data.step = 'transport';
+      orderData.set(userId, data);
+      
+      // Сохраняем имя и телефон в базу данных
+      try {
+        await database.updateClient(userId, data.name, data.phone);
+        console.log(`✅ Обновлены данные клиента ${userId}: ${data.name}, ${data.phone}`);
+      } catch (error) {
+        console.error('Ошибка сохранения данных клиента:', error);
+      }
+      
+      return ctx.reply('🚚 Введите номер транспорта:\n(например: 1234 AB)');
+    }
+
+    // Шаг 7: Номер транспорта
+    if (data.step === 'transport') {
+      data.transport = text;
+      data.step = 'comment';
+      orderData.set(userId, data);
+      return ctx.reply('📝 Введите комментарий или отправьте "-" чтобы пропустить:');
+    }
+
+    // Шаг 8: Комментарий
+    if (data.step === 'comment') {
+      data.comment = text === '-' ? '' : text;
+      data.step = 'confirm';
+      orderData.set(userId, data);
+      
+      const preview = formatOrder(data);
+      const keyboard = [
+        [{ text: '✅ Подтвердить' }],
+        [{ text: '❌ Отменить' }]
+      ];
+      
+      return ctx.reply(
+        '📋 Проверьте заявку:\n\n' + preview + '\n\nВсе верно?',
+        { reply_markup: { keyboard, resize_keyboard: true, one_time_keyboard: true } }
+      );
+    }
+
+    // Подтверждение заявки
+    if (text === '✅ Подтвердить') {
+      const orderMessage = formatOrder(data);
+      
+      // Сохранение в БД
+      try {
+        // Если администратор создает заявку для клиента, используем telegram_id клиента
+        const clientTelegramId = data.selectedClient ? data.selectedClient.telegram_id : userId;
+        const user = await database.getOrCreateUser(clientTelegramId, data.name, data.phone);
+        const orderId = await database.createOrder(
+          user.id,
+          data.warehouse,
+          data.transport,
+          data.comment
+        );
+        
+        for (const item of data.items) {
+          await database.addOrderItem(orderId, item.product, item.quantity);
         }
         
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
+        ctx.reply('💾 Заявка сохранена в базе данных');
+      } catch (error) {
+        console.error('Ошибка сохранения в БД:', error);
+      }
 
-// Экспорт прихода товаров в Excel
-bot.action(/^exincp_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastIncomeProducts) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { items, periodName, year, totals } = session.lastIncomeProducts;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Приход товаров');
+      // Отправка в Telegram группу
+      const groupId = process.env.TELEGRAM_GROUP_ID;
+      let telegramSent = false;
+      
+      if (groupId) {
+        try {
+          await bot.telegram.sendMessage(groupId, orderMessage);
+          console.log('✅ Заявка отправлена в Telegram группу');
+          telegramSent = true;
+        } catch (error) {
+          console.error('❌ Ошибка отправки в Telegram группу:', error.message);
+        }
+      }
+
+      // 🎯 УМНАЯ МАРШРУТИЗАЦИЯ WhatsApp по складам
+      let whatsappSent = false;
+      
+      try {
+        console.log(`🔍 Проверка маршрутизации для склада: "${data.warehouse}"`);
         
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Вагон', key: 'wagon', width: 15 },
-            { header: 'Фирма', key: 'company', width: 18 },
-            { header: 'Склад', key: 'warehouse', width: 15 },
-            { header: 'Товар', key: 'product', width: 18 },
-            { header: 'По док', key: 'qtyDoc', width: 10 },
-            { header: 'Факт', key: 'qtyFact', width: 10 },
-            { header: 'Разница', key: 'difference', width: 10 },
-            { header: 'Вес (т)', key: 'weightTons', width: 10 },
-            { header: 'Примечания', key: 'notes', width: 25 }
+        // Получаем настройки WhatsApp для выбранного склада (группа, номер и Green-API)
+        let warehouseWhatsAppSettings = null;
+        try {
+          warehouseWhatsAppSettings = await database.getWarehouseWhatsAppSettings(data.warehouse);
+        } catch (error) {
+          console.log(`⚠️ Ошибка получения настроек WhatsApp: ${error.message}`);
+        }
+        
+        const warehouseWhatsAppGroup = warehouseWhatsAppSettings?.whatsapp_group_id;
+        const warehouseWhatsAppPhone = warehouseWhatsAppSettings?.whatsapp_phone;
+        const warehouseGreenApiInstance = warehouseWhatsAppSettings?.green_api_instance_id;
+        const warehouseGreenApiToken = warehouseWhatsAppSettings?.green_api_token;
+        
+        console.log(`📱 WhatsApp группа для склада "${data.warehouse}": ${warehouseWhatsAppGroup || 'не найдена'}`);
+        console.log(`📱 WhatsApp номер для склада "${data.warehouse}": ${warehouseWhatsAppPhone || 'не указан'}`);
+        console.log(`🔑 Green-API инстанс для склада "${data.warehouse}": ${warehouseGreenApiInstance || 'не настроен (используется общий)'}`);
+        
+        // Приоритет 1: Личный номер склада
+        if (warehouseWhatsAppPhone) {
+          console.log(`📤 Отправка заявки на личный WhatsApp номер склада "${data.warehouse}": ${warehouseWhatsAppPhone}`);
+          whatsappSent = await whatsapp.sendMessage(
+            orderMessage, 
+            warehouseWhatsAppPhone,
+            warehouseGreenApiInstance,
+            warehouseGreenApiToken
+          );
+          
+          if (whatsappSent) {
+            console.log(`✅ Заявка отправлена на личный WhatsApp номер склада "${data.warehouse}"`);
+          } else {
+            console.log(`❌ Ошибка отправки на личный номер склада "${data.warehouse}"`);
+          }
+        }
+        // Приоритет 2: Группа склада
+        else if (warehouseWhatsAppGroup) {
+          console.log(`📤 Отправка заявки в WhatsApp группу склада "${data.warehouse}": ${warehouseWhatsAppGroup}`);
+          whatsappSent = await whatsapp.sendToGroup(
+            orderMessage, 
+            warehouseWhatsAppGroup,
+            warehouseGreenApiInstance,
+            warehouseGreenApiToken
+          );
+          
+          if (whatsappSent) {
+            console.log(`✅ Заявка отправлена в WhatsApp группу склада "${data.warehouse}"`);
+          } else {
+            console.log(`❌ Ошибка отправки в группу склада "${data.warehouse}"`);
+          }
+        }
+        // Приоритет 3: Общие настройки
+        else {
+          console.log(`⚠️ У склада "${data.warehouse}" нет привязанных WhatsApp настроек, используем общие`);
+          
+          const whatsappGroupId = process.env.WHATSAPP_GROUP_ID;
+          const whatsappRecipient = process.env.WHATSAPP_RECIPIENT;
+          
+          console.log(`📋 Общая группа: ${whatsappGroupId || 'не настроена'}`);
+          console.log(`📋 Общий получатель: ${whatsappRecipient || 'не настроен'}`);
+          
+          if (whatsappGroupId) {
+            // Отправка в общую WhatsApp группу
+            console.log(`📤 Отправка в общую WhatsApp группу: ${whatsappGroupId}`);
+            whatsappSent = await whatsapp.sendToGroup(orderMessage, whatsappGroupId);
+          } else if (whatsappRecipient) {
+            // Отправка общему личному получателю
+            console.log(`📤 Отправка общему личному получателю: ${whatsappRecipient}`);
+            whatsappSent = await whatsapp.sendMessage(orderMessage, whatsappRecipient);
+          }
+        }
+      } catch (error) {
+        console.error('❌ Ошибка отправки в WhatsApp:', error);
+      }
+      
+      // Уведомление пользователя
+      let statusMessage = '';
+      if (telegramSent && whatsappSent) {
+        statusMessage = `✅ Заявка отправлена в Telegram и WhatsApp группу склада "${data.warehouse}"!`;
+      } else if (telegramSent) {
+        statusMessage = '✅ Заявка отправлена в Telegram группу!';
+      } else if (whatsappSent) {
+        statusMessage = `✅ Заявка отправлена в WhatsApp группу склада "${data.warehouse}"!`;
+      } else {
+        statusMessage = '⚠️ Заявка сохранена в базе данных';
+      }
+      
+      ctx.reply(statusMessage, {
+        reply_markup: { remove_keyboard: true }
+      });
+
+      // Очистка данных
+      orderData.delete(userId);
+      
+      // Возвращаем меню
+      const isAdminUser = admin.isAdmin(userId);
+      
+      if (isAdminUser) {
+        const keyboard = [
+          [{ text: '📦 Создать заявку' }],
+          [{ text: '👨‍💼 Панель администратора' }]
         ];
         
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FF4CAF50' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
+        setTimeout(() => {
+          ctx.reply('Главное меню:', {
+            reply_markup: { keyboard, resize_keyboard: true }
+          });
+        }, 2000);
+      } else {
+        const keyboard = [
+          [{ text: '🏬 Склад' }]
+        ];
         
-        // Данные
-        items.forEach((item, i) => {
-            sheet.addRow({
-                num: i + 1,
-                date: item.date,
-                wagon: item.wagon,
-                company: item.company,
-                warehouse: item.warehouse,
-                product: item.product,
-                qtyDoc: item.qtyDoc,
-                qtyFact: item.qtyFact,
-                difference: item.difference,
-                weightTons: item.weightTons,
-                notes: item.notes
-            });
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            date: '',
-            wagon: '',
-            company: '',
-            warehouse: '',
-            product: 'ИТОГО:',
-            qtyDoc: totals.doc,
-            qtyFact: totals.fact,
-            difference: totals.fact - totals.doc,
-            weightTons: totals.tons,
-            notes: ''
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Сохраняем файл
-        const fileName = `Приход_товаров_${periodName.replace(/\s/g, '_')}_${year}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: fileName },
-            { caption: `📦 Приход товаров\n📅 ${periodName}\n📊 ${items.length} записей\n⚖️ ${formatNumber(totals.tons)} тонн` }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
+        setTimeout(() => {
+          ctx.reply('Создать новую заявку? Нажмите "🏬 Склад"', {
+            reply_markup: { keyboard, resize_keyboard: true }
+          });
+        }, 2000);
+      }
     }
+
+    // Отмена заявки
+    if (text === '❌ Отменить') {
+      orderData.delete(userId);
+      ctx.reply('❌ Заявка отменена. Для новой заявки нажмите /start', {
+        reply_markup: { remove_keyboard: true }
+      });
+    }
+
+  } catch (error) {
+    console.error('Ошибка обработки:', error);
+    ctx.reply('❌ Произошла ошибка. Попробуйте снова /start');
+    orderData.delete(userId);
+  }
 });
 
-// Карточка клиента - выбор клиента
-bot.hears(/👤|карточка клиента/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка списка клиентов...');
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        // Получаем список клиентов из разных источников
-        let clientNames = [];
-        
-        // Если clients - массив
-        if (Array.isArray(data.clients)) {
-            data.clients.forEach(c => {
-                // Фильтруем удаленных клиентов
-                if (typeof c === 'string') {
-                    clientNames.push(c);
-                } else if (c && c.name && !c.isDeleted) {
-                    clientNames.push(c.name);
-                }
-            });
-        }
-        // Если clients - объект
-        else if (data.clients && typeof data.clients === 'object') {
-            Object.values(data.clients).forEach(c => {
-                // Фильтруем удаленных клиентов
-                if (typeof c === 'string') {
-                    clientNames.push(c);
-                } else if (c && c.name && !c.isDeleted) {
-                    clientNames.push(c.name);
-                }
-            });
-        }
-        
-        // Также собираем клиентов из расходов (только неудаленные записи)
-        const yearData = data?.years?.[year];
-        if (yearData && yearData.expense) {
-            yearData.expense.filter(e => !e.isDeleted).forEach(e => {
-                if (e.client && !clientNames.includes(e.client)) {
-                    clientNames.push(e.client);
-                }
-            });
-        }
-        
-        // Сортируем и убираем дубликаты
-        clientNames = [...new Set(clientNames)].sort();
-        
-        if (clientNames.length === 0) {
-            return ctx.reply('👤 Нет клиентов в базе');
-        }
-        
-        // Сохраняем маппинг клиентов по индексу
-        sessions[userId].clientsList = clientNames;
-        saveSessions();
-        
-        // Создаём inline кнопки для всех клиентов (убираем лимит 50)
-        const buttons = clientNames.map((client, index) => {
-            const shortName = client.length > 25 ? client.substring(0, 22) + '...' : client;
-            return [Markup.button.callback(`👤 ${shortName}`, `cl_${index}`)];
-        });
-        
-        ctx.reply(
-            `👤 *КАРТОЧКА КЛИЕНТА*\n📅 Год: *${year}*\n\nВыберите клиента (${clientNames.length}):`,
-            {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard(buttons)
-            }
-        );
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Обработка выбора клиента
-bot.action(/^cl_(\d+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const clientIndex = parseInt(ctx.match[1]);
-    
-    // Получаем имя клиента из списка
-    const session = getSession(userId);
-    const clientName = session.clientsList?.[clientIndex];
-    
-    if (!clientName) {
+// Обработка inline-кнопок (callback_query)
+bot.on('callback_query', async (ctx) => {
+  const userId = ctx.from.id;
+  const callbackData = ctx.callbackQuery.data;
+  
+  // Проверка прав доступа
+  const isAdminUser = admin.isAdmin(userId);
+  
+  if (!isAdminUser) {
+    return ctx.answerCbQuery('❌ У вас нет прав для этого действия');
+  }
+  
+  try {
+    // Обработка выбора клиента
+    if (callbackData.startsWith('select_client_')) {
+      const clientTelegramId = callbackData.replace('select_client_', '');
+      const data = orderData.get(userId);
+      
+      console.log('🔍 Поиск клиента с telegram_id:', clientTelegramId);
+      
+      if (!data || data.step !== 'select_client' || !data.clientsList) {
+        console.log('❌ Данные заявки не найдены');
+        return ctx.answerCbQuery('❌ Ошибка: данные заявки не найдены');
+      }
+      
+      console.log('📋 Список клиентов:', data.clientsList.map(c => ({ id: c.telegram_id, name: c.name })));
+      
+      // Ищем выбранного клиента в списке (сравниваем как строки)
+      const selectedClient = data.clientsList.find(client => 
+        String(client.telegram_id) === String(clientTelegramId)
+      );
+      
+      if (!selectedClient) {
+        console.log('❌ Клиент не найден в списке');
         return ctx.answerCbQuery('❌ Клиент не найден');
+      }
+      
+      console.log('✅ Клиент найден:', selectedClient.name);
+      
+      // Сохраняем данные выбранного клиента
+      data.selectedClient = selectedClient;
+      data.name = selectedClient.name;
+      data.phone = selectedClient.phone;
+      data.step = 'transport';
+      orderData.set(userId, data);
+      
+      // Отвечаем на callback
+      await ctx.answerCbQuery(`✅ Выбран клиент: ${selectedClient.name}`);
+      
+      // Редактируем сообщение, убирая кнопки
+      let summary = '📋 Ваша заявка:\n\n';
+      summary += `👤 Клиент: ${selectedClient.name}\n`;
+      summary += `📞 Телефон: ${selectedClient.phone}\n`;
+      summary += `🏬 Склад: ${data.warehouse}\n\n`;
+      summary += 'Товары:\n';
+      data.items.forEach((item, i) => {
+        summary += `${i + 1}. ${item.product} — ${item.quantity}\n`;
+      });
+      
+      await ctx.editMessageText(summary);
+      
+      // Отправляем новое сообщение с запросом номера транспорта
+      await ctx.reply('🚚 Введите номер транспорта:\n(например: 1234 AB)', {
+        reply_markup: { remove_keyboard: true }
+      });
     }
-    
-    await ctx.answerCbQuery('⏳ Загрузка карточки...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const cardData = calculateClientCard(data, year, clientName);
-        
-        // Формируем текстовое сообщение
-        let msg = `👤 *КАРТОЧКА КЛИЕНТА*\n`;
-        msg += `📋 *${clientName}*\n`;
-        msg += `📅 Год: *${year}*\n`;
-        msg += `${'─'.repeat(25)}\n\n`;
-        
-        msg += `📊 *СВОДКА:*\n`;
-        msg += `📦 Куплено: *${formatNumber(cardData.totalTons)} т*\n`;
-        msg += `💵 Сумма покупок: *${formatNumber(cardData.totalSum)} $*\n`;
-        msg += `✅ Оплачено: *${formatNumber(cardData.totalPaid)} $*\n`;
-        msg += `💳 Остаток долга: *${formatNumber(cardData.debt)} $*\n\n`;
-        
-        if (cardData.purchases.length > 0) {
-            msg += `${'─'.repeat(25)}\n`;
-            msg += `📉 *ПОСЛЕДНИЕ ПОКУПКИ (до 10):*\n\n`;
-            
-            cardData.purchases.slice(0, 10).forEach((p, i) => {
-                msg += `${i + 1}. ${p.date}\n`;
-                msg += `   ${p.product} - ${formatNumber(p.tons)} т\n`;
-                msg += `   💵 ${formatNumber(p.total)} $\n\n`;
-            });
+
+    // ── Касса: выбор клиента ──
+    if (callbackData.startsWith('cash_client_')) {
+      const clientTelegramId = callbackData.replace('cash_client_', '');
+      const allClients = await database.getAllClients();
+      const client = allClients.find(c => String(c.telegram_id) === String(clientTelegramId));
+
+      if (!client) return ctx.answerCbQuery('❌ Клиент не найден');
+
+      orderData.set(userId, {
+        step: 'cash_select_mode',
+        cashClient: client,
+        createdAt: Date.now()
+      });
+
+      await ctx.answerCbQuery(`✅ ${client.name}`);
+      await ctx.editMessageText(
+        `💰 Касса — Инкассо\n\n` +
+        `👤 Клиент: ${client.name}\n` +
+        `📞 Телефон: ${client.phone || 'не указан'}\n\n` +
+        `💱 Какую валюту принёс клиент?`,
+        {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: '💵 Доллар', callback_data: 'cash_mode_usd' }],
+              [{ text: '💴 Сомони', callback_data: 'cash_mode_somoni' }],
+              [{ text: '💵+💴 Обе валюты', callback_data: 'cash_mode_both' }],
+              [{ text: '❌ Отмена', callback_data: 'cash_cancel' }]
+            ]
+          }
         }
-        
-        if (cardData.payments.length > 0) {
-            msg += `${'─'.repeat(25)}\n`;
-            msg += `💵 *ПОСЛЕДНИЕ ПЛАТЕЖИ (до 10):*\n\n`;
-            
-            cardData.payments.slice(0, 10).forEach((p, i) => {
-                msg += `${i + 1}. ${p.date} - *${formatNumber(p.amount)} $*\n`;
-            });
-        }
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastClientCard = { clientName, cardData, year };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `excl_${clientIndex}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки карточки');
+      );
     }
+
+    // ── Касса: выбор режима валюты ──
+    if (callbackData.startsWith('cash_mode_')) {
+      const mode = callbackData.replace('cash_mode_', ''); // usd | somoni | both
+      const data = orderData.get(userId);
+      if (!data) return ctx.answerCbQuery('❌ Данные устарели');
+
+      data.cashMode = mode;
+      orderData.set(userId, data);
+
+      if (mode === 'usd' || mode === 'both') {
+        data.step = 'cash_enter_usd';
+        orderData.set(userId, data);
+        await ctx.answerCbQuery();
+        await ctx.editMessageText(
+          `👤 ${data.cashClient.name}\n\n💵 Введите сумму в долларах:`
+        );
+      } else {
+        // только сомони
+        data.step = 'cash_enter_somoni';
+        orderData.set(userId, data);
+        await ctx.answerCbQuery();
+        await ctx.editMessageText(
+          `👤 ${data.cashClient.name}\n\n💴 Введите сумму в сомони:`
+        );
+      }
+    }
+
+    // ── Касса: подтверждение отправки ──
+    if (callbackData === 'cash_send') {
+      const data = orderData.get(userId);
+      if (!data || data.step !== 'cash_confirm') return ctx.answerCbQuery('❌ Данные устарели');
+
+      const cashierPhone = process.env.CASHIER_WHATSAPP_PHONE || process.env.WHATSAPP_RECIPIENT;
+      if (!cashierPhone) {
+        await ctx.answerCbQuery('❌ Номер кассира не настроен');
+        return ctx.reply('❌ Добавьте переменную CASHIER_WHATSAPP_PHONE в Railway');
+      }
+
+      const sent = await whatsapp.sendMessage(data.cashMessage, cashierPhone);
+      await ctx.answerCbQuery(sent ? '✅ Отправлено!' : '❌ Ошибка отправки');
+      await ctx.editMessageText(
+        sent
+          ? `✅ Сообщение отправлено кассиру!\n\n${data.cashMessage}`
+          : `❌ Ошибка отправки в WhatsApp. Сообщение:\n\n${data.cashMessage}`
+      );
+
+      orderData.delete(userId);
+
+      setTimeout(() => {
+        ctx.reply('Главное меню:', {
+          reply_markup: {
+            keyboard: [[{ text: '📦 Создать заявку' }], [{ text: '👨‍💼 Панель администратора' }]],
+            resize_keyboard: true
+          }
+        });
+      }, 1500);
+    }
+
+    if (callbackData === 'cash_cancel') {
+      orderData.delete(userId);
+      await ctx.answerCbQuery('Отменено');
+      await ctx.editMessageText('❌ Инкассо отменено');
+    }
+
+  } catch (error) {
+    console.error('Ошибка обработки callback:', error);
+    ctx.answerCbQuery('❌ Произошла ошибка');
+  }
 });
 
-// Экспорт карточки клиента в Excel
-bot.action(/^excl_(\d+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
+// Команда /profile - изменить свои данные
+bot.command('profile', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  const isClientUser = await database.isClient(userId);
+  
+  if (!isClientUser && !admin.isAdmin(userId)) {
+    return ctx.reply('❌ У вас нет доступа к боту');
+  }
+  
+  try {
+    const client = await database.getClient(userId);
     
-    if (!session.lastClientCard) {
-        return ctx.answerCbQuery('❌ Сначала выберите клиента');
+    if (!client) {
+      return ctx.reply('❌ Ваши данные не найдены');
     }
     
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { clientName, cardData, year } = session.lastClientCard;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        
-        // Лист 1: Сводка
-        const summarySheet = workbook.addWorksheet('Сводка');
-        summarySheet.columns = [
-            { header: 'Параметр', key: 'param', width: 25 },
-            { header: 'Значение', key: 'value', width: 20 }
-        ];
-        
-        summarySheet.addRow({ param: 'КАРТОЧКА КЛИЕНТА', value: '' });
-        summarySheet.addRow({ param: 'Клиент', value: clientName });
-        summarySheet.addRow({ param: 'Год', value: year });
-        summarySheet.addRow({ param: '', value: '' });
-        summarySheet.addRow({ param: 'Куплено (тонн)', value: cardData.totalTons });
-        summarySheet.addRow({ param: 'Сумма покупок ($)', value: cardData.totalSum });
-        summarySheet.addRow({ param: 'Оплачено ($)', value: cardData.totalPaid });
-        summarySheet.addRow({ param: 'Остаток долга ($)', value: cardData.debt });
-        
-        // Стиль заголовка
-        summarySheet.getRow(1).font = { bold: true, size: 14 };
-        
-        // Лист 2: Покупки
-        const purchasesSheet = workbook.addWorksheet('Покупки');
-        purchasesSheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Склад', key: 'warehouse', width: 15 },
-            { header: 'Товар', key: 'product', width: 20 },
-            { header: 'Кол-во (мешки)', key: 'qty', width: 15 },
-            { header: 'Тонны', key: 'tons', width: 10 },
-            { header: 'Цена', key: 'price', width: 10 },
-            { header: 'Сумма ($)', key: 'total', width: 12 }
-        ];
-        
-        cardData.purchases.forEach((p, i) => {
-            purchasesSheet.addRow({
-                num: i + 1,
-                date: p.date,
-                warehouse: p.warehouse,
-                product: p.product,
-                qty: p.qty,
-                tons: p.tons,
-                price: p.price,
-                total: p.total
-            });
-        });
-        
-        // Стиль заголовков
-        purchasesSheet.getRow(1).font = { bold: true };
-        purchasesSheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFE0E0E0' }
-        };
-        
-        // Лист 3: Платежи
-        const paymentsSheet = workbook.addWorksheet('Платежи');
-        paymentsSheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Сумма ($)', key: 'amount', width: 15 },
-            { header: 'Примечание', key: 'note', width: 30 }
-        ];
-        
-        cardData.payments.forEach((p, i) => {
-            paymentsSheet.addRow({
-                num: i + 1,
-                date: p.date,
-                amount: p.amount,
-                note: p.note || ''
-            });
-        });
-        
-        paymentsSheet.getRow(1).font = { bold: true };
-        paymentsSheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFE0E0E0' }
-        };
-        
-        // Сохраняем файл
-        const fileName = `Карточка_${clientName.replace(/[^a-zA-Zа-яА-Я0-9]/g, '_')}_${year}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument({ source: filePath, filename: fileName });
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
-});
-
-// Функция расчёта данных карточки клиента
-function calculateClientCard(data, year, clientName) {
-    const yearData = data?.years?.[year];
-    if (!yearData) return { totalTons: 0, totalSum: 0, totalPaid: 0, debt: 0, purchases: [], payments: [] };
-    
-    const purchases = [];
-    const payments = [];
-    let totalTons = 0;
-    let totalSum = 0;
-    let totalPaid = 0;
-    
-    // Собираем покупки (только неудаленные записи)
-    (yearData.expense || []).filter(e => !e.isDeleted).forEach(e => {
-        if (e.client === clientName) {
-            const tons = (e.quantity || 0) / 20;
-            purchases.push({
-                date: e.date || '',
-                warehouse: e.warehouse || '',
-                product: e.product || '',
-                qty: e.quantity || 0,
-                tons: tons,
-                price: e.price || 0,
-                total: e.total || 0
-            });
-            totalTons += tons;
-            totalSum += e.total || 0;
-        }
-    });
-    
-    // Собираем платежи (только неудаленные записи)
-    (yearData.payments || []).filter(p => !p.isDeleted).forEach(p => {
-        if (p.client === clientName) {
-            payments.push({
-                date: p.date || '',
-                amount: p.amount || 0,
-                note: p.note || ''
-            });
-            totalPaid += p.amount || 0;
-        }
-    });
-    
-    // Сортируем по дате (новые первые)
-    purchases.sort((a, b) => new Date(b.date) - new Date(a.date));
-    payments.sort((a, b) => new Date(b.date) - new Date(a.date));
-    
-    return {
-        totalTons,
-        totalSum,
-        totalPaid,
-        debt: totalSum - totalPaid,
-        purchases,
-        payments
-    };
-}
-
-// 🔔 Уведомления о долгах - клиенты, которые покупали N дней назад
-bot.hears(/🔔|уведомления о долгах/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    // Показываем кнопки выбора количества дней
-    const daysButtons = Markup.inlineKeyboard([
-        [Markup.button.callback('📅 7 дней назад', 'notify_7')],
-        [Markup.button.callback('📅 14 дней назад', 'notify_14')],
-        [Markup.button.callback('📅 30 дней назад', 'notify_30')]
-    ]);
+    const keyboard = [
+      [{ text: '✏️ Изменить имя' }],
+      [{ text: '✏️ Изменить телефон' }],
+      [{ text: '🔙 Отмена' }]
+    ];
     
     ctx.reply(
-        `🔔 *УВЕДОМЛЕНИЯ О ДОЛГАХ*\n📅 Год: *${year}*\n\nВыберите период:\n_Показать клиентов с долгами, которые покупали:_`,
-        { parse_mode: 'Markdown', ...daysButtons }
+      '👤 Ваш профиль:\n\n' +
+      `Имя: ${client.name || 'не указано'}\n` +
+      `Телефон: ${client.phone || 'не указан'}\n\n` +
+      'Что хотите изменить?',
+      { reply_markup: { keyboard, resize_keyboard: true } }
     );
+    
+  } catch (error) {
+    console.error('Ошибка получения профиля:', error);
+    ctx.reply('❌ Ошибка при получении данных профиля');
+  }
 });
 
-// Обработка выбора периода для уведомлений
-bot.action(/^notify_(\d+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const daysAgo = parseInt(ctx.match[1]);
-    
-    await ctx.answerCbQuery('⏳ Поиск должников...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const debtorsWithPurchases = clientNotifications.findDebtorsWithPurchaseOnDate(data, year, daysAgo);
-        
-        if (debtorsWithPurchases.length === 0) {
-            return ctx.reply(`✅ Нет должников, которые покупали ${daysAgo} дней назад`);
-        }
-        
-        // Формируем дату покупки
-        const targetDate = new Date();
-        targetDate.setDate(targetDate.getDate() - daysAgo);
-        const formattedDate = targetDate.toLocaleDateString('ru-RU');
-        
-        let msg = `🔔 *УВЕДОМЛЕНИЯ О ДОЛГАХ*\n`;
-        msg += `📅 Клиенты, которые покупали ${formattedDate} (${daysAgo} дней назад)\n`;
-        msg += `${'═'.repeat(30)}\n\n`;
-        
-        let totalDebt = 0;
-        let totalNotificationAmount = 0;
-        
-        debtorsWithPurchases.forEach((debtor, i) => {
-            msg += `${i + 1}. 👤 *${debtor.client}*\n`;
-            msg += `   💳 Общий долг: *${clientNotifications.formatNumber(debtor.debt)} $*\n`;
-            
-            // Показываем покупки за указанную дату
-            msg += `   📦 Покупки ${formattedDate}:\n`;
-            debtor.purchases.forEach(purchase => {
-                msg += `      • ${purchase.product} - ${purchase.quantity} шт (${clientNotifications.formatNumber(purchase.total)} $)\n`;
-            });
-            msg += `   💰 Сумма покупок в тот день: *${clientNotifications.formatNumber(debtor.totalPurchaseAmount)} $*\n\n`;
-            
-            totalDebt += debtor.debt;
-            totalNotificationAmount += debtor.totalPurchaseAmount;
-        });
-        
-        msg += `${'═'.repeat(30)}\n`;
-        msg += `📊 *ИТОГО:*\n`;
-        msg += `   👥 Должников: *${debtorsWithPurchases.length}*\n`;
-        msg += `   💳 Общий долг: *${clientNotifications.formatNumber(totalDebt)} $*\n`;
-        msg += `   💰 Сумма покупок ${formattedDate}: *${clientNotifications.formatNumber(totalNotificationAmount)} $*\n\n`;
-        msg += `⚠️ _Рекомендуется связаться с этими клиентами для напоминания о долге_`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastDebtNotifications = { 
-            debtorsWithPurchases, 
-            daysAgo, 
-            formattedDate, 
-            year,
-            totalDebt,
-            totalNotificationAmount
-        };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `exnotify_${daysAgo}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
-    } catch (e) {
-        console.error('Ошибка уведомлений:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
+// Обработка изменения имени
+bot.hears('✏️ Изменить имя', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  const isClientUser = await database.isClient(userId);
+  
+  if (!isClientUser && !admin.isAdmin(userId)) {
+    return;
+  }
+  
+  const data = orderData.get(userId) || {};
+  data.editingProfile = 'name';
+  orderData.set(userId, data);
+  
+  ctx.reply(
+    '✏️ Введите новое имя:',
+    { reply_markup: { remove_keyboard: true } }
+  );
 });
 
-// Экспорт уведомлений о долгах в Excel
-bot.action(/^exnotify_(\d+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastDebtNotifications) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { debtorsWithPurchases, daysAgo, formattedDate, year, totalDebt, totalNotificationAmount } = session.lastDebtNotifications;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Уведомления о долгах');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Клиент', key: 'client', width: 25 },
-            { header: 'Общий долг ($)', key: 'totalDebt', width: 15 },
-            { header: 'Покупки в тот день ($)', key: 'dayPurchases', width: 20 },
-            { header: 'Товары', key: 'products', width: 30 },
-            { header: 'Склады', key: 'warehouses', width: 20 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFFF9800' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        
-        // Данные
-        debtorsWithPurchases.forEach((debtor, i) => {
-            const products = debtor.purchases.map(p => `${p.product} (${p.quantity} шт)`).join(', ');
-            const warehouses = [...new Set(debtor.purchases.map(p => p.warehouse))].join(', ');
-            
-            const row = sheet.addRow({
-                num: i + 1,
-                client: debtor.client,
-                totalDebt: debtor.debt,
-                dayPurchases: debtor.totalPurchaseAmount,
-                products: products,
-                warehouses: warehouses
-            });
-            
-            // Подсветка больших долгов
-            if (debtor.debt > 5000) {
-                row.getCell('totalDebt').fill = {
-                    type: 'pattern',
-                    pattern: 'solid',
-                    fgColor: { argb: 'FFFFCDD2' }
-                };
-            }
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            client: 'ИТОГО:',
-            totalDebt: totalDebt,
-            dayPurchases: totalNotificationAmount,
-            products: '',
-            warehouses: ''
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Форматирование числовых колонок
-        sheet.getColumn('totalDebt').numFmt = '#,##0.00';
-        sheet.getColumn('dayPurchases').numFmt = '#,##0.00';
-        
-        // Сохраняем файл
-        const fileName = `Уведомления_о_долгах_${daysAgo}_дней_${year}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: fileName },
-            { 
-                caption: `🔔 Уведомления о долгах\n📅 Покупки ${formattedDate} (${daysAgo} дней назад)\n👥 ${debtorsWithPurchases.length} должников\n💳 Общий долг: ${clientNotifications.formatNumber(totalDebt)} $` 
-            }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
+// Обработка изменения телефона
+bot.hears('✏️ Изменить телефон', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  const isClientUser = await database.isClient(userId);
+  
+  if (!isClientUser && !admin.isAdmin(userId)) {
+    return;
+  }
+  
+  const data = orderData.get(userId) || {};
+  data.editingProfile = 'phone';
+  orderData.set(userId, data);
+  
+  ctx.reply(
+    '✏️ Введите новый номер телефона:\n(например: +992900000000)',
+    { reply_markup: { remove_keyboard: true } }
+  );
 });
 
-// Остатки складов
-bot.hears(/📦|\/stock|остатки складов/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
+bot.hears('🔙 Отмена', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  orderData.delete(userId);
+  
+  const isAdminUser = admin.isAdmin(userId);
+  
+  if (isAdminUser) {
+    const keyboard = [
+      [{ text: '📦 Создать заявку' }],
+      [{ text: '👨‍💼 Панель администратора' }]
+    ];
     
-    await ctx.reply('⏳ Загрузка...');
-    try {
-        const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные из базы');
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
-        
-        const balances = calculateStock(data, year);
-        if (!balances || !Object.keys(balances).length) return ctx.reply(`📦 Нет данных об остатках за ${year} год`);
-
-        let msg = `📦 *ОСТАТКИ СКЛАДОВ*\n📅 ${year}\n${'─'.repeat(20)}\n\n`;
-        let total = 0;
-
-        Object.entries(balances).sort().forEach(([wh, items]) => {
-            msg += `🏪 *${wh}*\n`;
-            let whTotal = 0;
-            items.forEach(i => {
-                msg += `  ${i.company} ${i.product}: ${formatNumber(i.tons)} т\n`;
-                whTotal += i.tons;
-            });
-            msg += `  _Итого: ${formatNumber(whTotal)} т_\n\n`;
-            total += whTotal;
-        });
-
-        msg += `${'─'.repeat(20)}\n📊 *ИТОГО: ${formatNumber(total)} тонн*`;
-        
-        if (msg.length > 4000) {
-            for (const part of msg.match(/[\s\S]{1,4000}/g)) await ctx.reply(part, { parse_mode: 'Markdown' });
-        } else {
-            ctx.reply(msg, { parse_mode: 'Markdown' });
-        }
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Фактический остаток (как в веб-приложении)
-bot.hears(/🏭|фактический остаток/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка фактических остатков...');
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные из базы');
-        
-        const factBalance = calculateFactBalance(data, year);
-        
-        if (!factBalance || Object.keys(factBalance.warehouses).length === 0) {
-            return ctx.reply(`🏭 Нет данных о фактических остатках за ${year} год`);
-        }
-
-        let msg = `🏭 *ФАКТИЧЕСКИЙ ОСТАТОК*\n📅 ${year}\n${'═'.repeat(25)}\n\n`;
-        
-        // Группируем по группам складов
-        const groups = {};
-        Object.entries(factBalance.warehouses).forEach(([whName, products]) => {
-            const groupName = factBalance.warehouseGroups[whName] || 'Без группы';
-            if (!groups[groupName]) groups[groupName] = {};
-            groups[groupName][whName] = products;
-        });
-        
-        let grandTotal = 0;
-        
-        // Выводим по группам
-        Object.entries(groups).sort().forEach(([groupName, warehouses]) => {
-            msg += `📁 *${groupName}*\n`;
-            msg += `${'─'.repeat(20)}\n`;
-            
-            let groupTotal = 0;
-            
-            Object.entries(warehouses).sort().forEach(([whName, products]) => {
-                msg += `🏪 *${whName}*\n`;
-                let whTotal = 0;
-                
-                Object.entries(products).sort().forEach(([product, tons]) => {
-                    if (tons !== 0) {
-                        msg += `  • ${product}: ${formatNumber(tons)} т\n`;
-                        whTotal += tons;
-                    }
-                });
-                
-                if (whTotal !== 0) {
-                    msg += `  _Итого: ${formatNumber(whTotal)} т_\n`;
-                }
-                msg += `\n`;
-                groupTotal += whTotal;
-            });
-            
-            msg += `📊 *Итого ${groupName}: ${formatNumber(groupTotal)} т*\n\n`;
-            grandTotal += groupTotal;
-        });
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `🏭 *ОБЩИЙ ИТОГ: ${formatNumber(grandTotal)} тонн*\n\n`;
-        
-        // Итоги по товарам
-        if (Object.keys(factBalance.productTotals).length > 0) {
-            msg += `📦 *ИТОГО ПО ТОВАРАМ:*\n`;
-            Object.entries(factBalance.productTotals).sort().forEach(([product, tons]) => {
-                if (tons !== 0) {
-                    msg += `  • ${product}: ${formatNumber(tons)} т\n`;
-                }
-            });
-        }
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (const part of parts) {
-                await ctx.reply(part, { parse_mode: 'Markdown' });
-            }
-        } else {
-            ctx.reply(msg, { parse_mode: 'Markdown' });
-        }
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Долги клиентов
-bot.hears(/💰|\/debts|долги/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка...');
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные из базы');
-        
-        const debts = calculateDebts(data, year);
-        if (!debts || !Object.keys(debts).length) return ctx.reply(`✅ Нет должников за ${year} год!`);
-
-        let msg = `💰 *ДОЛГИ КЛИЕНТОВ*\n📅 ${year}\n${'─'.repeat(20)}\n\n`;
-        let totalDebt = 0;
-
-        const sorted = Object.entries(debts).sort((a, b) => b[1].debt - a[1].debt);
-        
-        // Показываем до 30 клиентов
-        const showItems = sorted.slice(0, 30);
-        showItems.forEach(([client, d], i) => {
-            msg += `${i + 1}. *${client}*\n`;
-            msg += `   Сумма: ${formatNumber(d.total)} $\n`;
-            msg += `   Оплачено: ${formatNumber(d.paid)} $\n`;
-            msg += `   💳 Долг: *${formatNumber(d.debt)} $*\n\n`;
-            totalDebt += d.debt;
-        });
-        
-        // Добавляем остальных в итог
-        if (sorted.length > 30) {
-            let restDebt = 0;
-            sorted.slice(30).forEach(([_, d]) => {
-                totalDebt += d.debt;
-                restDebt += d.debt;
-            });
-            msg += `_...и ещё ${sorted.length - 30} клиентов на ${formatNumber(restDebt)} $_\n\n`;
-        }
-
-        msg += `${'─'.repeat(20)}\n👥 Должников: ${sorted.length}\n💰 *ИТОГО ДОЛГ: ${formatNumber(totalDebt)} $*`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastDebtsReport = { 
-            items: sorted.map(([client, d]) => ({ client, total: d.total, paid: d.paid, debt: d.debt })),
-            year,
-            totalDebt
-        };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', 'exdebts')]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт долгов в Excel
-bot.action('exdebts', async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastDebtsReport) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { items, year, totalDebt } = session.lastDebtsReport;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        const sheet = workbook.addWorksheet('Долги клиентов');
-        
-        // Заголовки
-        sheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Клиент', key: 'client', width: 30 },
-            { header: 'Сумма покупок ($)', key: 'total', width: 18 },
-            { header: 'Оплачено ($)', key: 'paid', width: 15 },
-            { header: 'Долг ($)', key: 'debt', width: 15 }
-        ];
-        
-        // Стиль заголовков
-        sheet.getRow(1).font = { bold: true };
-        sheet.getRow(1).fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFFF9800' }
-        };
-        sheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } };
-        
-        // Данные
-        let sumTotal = 0, sumPaid = 0, sumDebt = 0;
-        items.forEach((item, i) => {
-            const row = sheet.addRow({
-                num: i + 1,
-                client: item.client,
-                total: item.total,
-                paid: item.paid,
-                debt: item.debt
-            });
-            
-            // Подсветка больших долгов
-            if (item.debt > 10000) {
-                row.getCell('debt').fill = {
-                    type: 'pattern',
-                    pattern: 'solid',
-                    fgColor: { argb: 'FFFFCDD2' }
-                };
-            }
-            
-            sumTotal += item.total;
-            sumPaid += item.paid;
-            sumDebt += item.debt;
-        });
-        
-        // Итоговая строка
-        const totalRow = sheet.addRow({
-            num: '',
-            client: 'ИТОГО:',
-            total: sumTotal,
-            paid: sumPaid,
-            debt: sumDebt
-        });
-        totalRow.font = { bold: true };
-        totalRow.fill = {
-            type: 'pattern',
-            pattern: 'solid',
-            fgColor: { argb: 'FFEEEEEE' }
-        };
-        
-        // Форматирование числовых колонок
-        sheet.getColumn('total').numFmt = '#,##0.00';
-        sheet.getColumn('paid').numFmt = '#,##0.00';
-        sheet.getColumn('debt').numFmt = '#,##0.00';
-        
-        // Сохраняем файл
-        const fileName = `debts_${year}_${Date.now()}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        await workbook.xlsx.writeFile(filePath);
-        
-        // Отправляем файл
-        await ctx.replyWithDocument(
-            { source: filePath, filename: `Долги_клиентов_${year}.xlsx` },
-            { caption: `💰 Долги клиентов\n📅 ${year} год\n👥 ${items.length} должников\n💳 Итого долг: ${formatNumber(totalDebt)} $` }
-        );
-        
-        // Удаляем временный файл
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
-});
-
-// Сводка
-bot.hears(/📊|\/summary|сводка/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка...');
-    try {
-        const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные из базы');
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
-        
-        const yearData = data?.years?.[year];
-        if (!yearData) return ctx.reply(`📊 Нет данных за ${year} год`);
-
-        let totalIncome = 0, totalExpense = 0, totalPaid = 0, totalSum = 0;
-        
-        // Фильтруем удаленные записи
-        (yearData.income || []).filter(item => !item.isDeleted).forEach(i => totalIncome += (i.qtyFact || 0) / 20);
-        (yearData.expense || []).filter(item => !item.isDeleted).forEach(e => {
-            totalExpense += (e.quantity || 0) / 20;
-            totalSum += e.total || 0;
-        });
-        (yearData.payments || []).filter(item => !item.isDeleted).forEach(p => totalPaid += p.amount || 0);
-
-        const debts = calculateDebts(data, year);
-        let totalDebt = 0, debtors = 0;
-        if (debts) Object.values(debts).forEach(d => { totalDebt += d.debt; debtors++; });
-
-        const stock = calculateStock(data, year);
-        let totalStock = 0;
-        if (stock) Object.values(stock).forEach(items => items.forEach(i => totalStock += i.tons));
-
-        ctx.reply(
-            `📊 *СВОДКА ЗА ${year}*\n${'─'.repeat(20)}\n\n` +
-            `📥 Приход: *${formatNumber(totalIncome)} т*\n` +
-            `📤 Расход: *${formatNumber(totalExpense)} т*\n` +
-            `📦 Остаток: *${formatNumber(totalStock)} т*\n\n` +
-            `${'─'.repeat(20)}\n` +
-            `💵 Сумма продаж: *${formatNumber(totalSum)} $*\n` +
-            `✅ Оплачено: *${formatNumber(totalPaid)} $*\n` +
-            `💳 Общий долг: *${formatNumber(totalDebt)} $*\n` +
-            `👥 Должников: *${debtors}*`,
-            { parse_mode: 'Markdown' }
-        );
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Отчёт за день - выбор даты
-bot.hears(/📅 отчёт за день|отчет за день|\/daily/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    // Показываем кнопки выбора даты
-    const dateButtons = Markup.inlineKeyboard([
-        [Markup.button.callback('📅 Сегодня', 'daily_today')],
-        [Markup.button.callback('📅 Вчера', 'daily_yesterday')],
-        [Markup.button.callback('📅 Позавчера', 'daily_2days')]
-    ]);
-    
-    ctx.reply(
-        `📅 *ОТЧЁТ ЗА ДЕНЬ*\n📆 Год: *${year}*\n\nВыберите дату:`,
-        { parse_mode: 'Markdown', ...dateButtons }
-    );
-});
-
-// Обработка выбора даты для отчёта за день
-bot.action(/^daily_(today|yesterday|2days)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    const dateType = ctx.match[1];
-    
-    await ctx.answerCbQuery('⏳ Загрузка...');
-    
-    try {
-        const rawData = await getData();
-        if (!rawData) return ctx.reply('❌ Не удалось получить данные');
-        
-        // Фильтруем данные по группам складов пользователя
-        const data = filterDataByWarehouseGroup(rawData, userId);
-        
-        // Определяем дату
-        const today = new Date();
-        let reportDate;
-        let dateName;
-        
-        switch (dateType) {
-            case 'today':
-                reportDate = today.toISOString().split('T')[0];
-                dateName = 'Сегодня';
-                break;
-            case 'yesterday':
-                const yesterday = new Date(today);
-                yesterday.setDate(yesterday.getDate() - 1);
-                reportDate = yesterday.toISOString().split('T')[0];
-                dateName = 'Вчера';
-                break;
-            case '2days':
-                const twoDays = new Date(today);
-                twoDays.setDate(twoDays.getDate() - 2);
-                reportDate = twoDays.toISOString().split('T')[0];
-                dateName = 'Позавчера';
-                break;
-        }
-        
-        const dailyData = calculateDailyReport(data, year, reportDate);
-        
-        // Форматируем дату
-        const formattedDate = new Date(reportDate).toLocaleDateString('ru-RU', {
-            day: '2-digit',
-            month: '2-digit',
-            year: 'numeric'
-        });
-        
-        let msg = `📅 *ОТЧЁТ ЗА ${formattedDate}*\n`;
-        msg += `(${dateName})\n`;
-        msg += `${'═'.repeat(25)}\n\n`;
-        
-        // ПРИХОД
-        msg += `📦 *ПРИХОД ТОВАРОВ*\n`;
-        msg += `${'─'.repeat(20)}\n`;
-        
-        if (dailyData.income.length > 0) {
-            let incomeTotal = { doc: 0, fact: 0, tons: 0 };
-            
-            dailyData.income.forEach(item => {
-                msg += `🚂 ${item.wagon || '-'} | ${item.product}\n`;
-                msg += `   ${item.company} → ${item.warehouse}\n`;
-                msg += `   📄 ${item.qtyDoc} | ✅ ${item.qtyFact} | ⚖️ ${formatNumber(item.weightTons)} т\n\n`;
-                incomeTotal.doc += item.qtyDoc || 0;
-                incomeTotal.fact += item.qtyFact || 0;
-                incomeTotal.tons += item.weightTons || 0;
-            });
-            
-            msg += `📊 *Итого приход:* ${dailyData.income.length} операций\n`;
-            msg += `   📄 По док: ${incomeTotal.doc} | ✅ Факт: ${incomeTotal.fact}\n`;
-            msg += `   ⚖️ Вес: *${formatNumber(incomeTotal.tons)} т*\n\n`;
-        } else {
-            msg += `_Операций прихода не было_\n\n`;
-        }
-        
-        // РАСХОД
-        msg += `📤 *РАСХОД ТОВАРОВ*\n`;
-        msg += `${'─'.repeat(20)}\n`;
-        
-        if (dailyData.expense.length > 0) {
-            let expenseTotal = { qty: 0, tons: 0, sum: 0 };
-            
-            dailyData.expense.forEach(item => {
-                msg += `👤 ${item.client}\n`;
-                msg += `   ${item.product} | ${item.warehouse}\n`;
-                msg += `   📦 ${item.quantity} шт | ⚖️ ${formatNumber(item.tons)} т\n`;
-                msg += `   💵 *${formatNumber(item.total)} $*\n\n`;
-                expenseTotal.qty += item.quantity || 0;
-                expenseTotal.tons += item.tons || 0;
-                expenseTotal.sum += item.total || 0;
-            });
-            
-            msg += `📊 *Итого расход:* ${dailyData.expense.length} операций\n`;
-            msg += `   📦 ${expenseTotal.qty} шт | ⚖️ ${formatNumber(expenseTotal.tons)} т\n`;
-            msg += `   💰 Сумма: *${formatNumber(expenseTotal.sum)} $*\n\n`;
-        } else {
-            msg += `_Операций расхода не было_\n\n`;
-        }
-        
-        // СВОДКА
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 *СВОДКА ЗА ДЕНЬ:*\n`;
-        msg += `   📦 Приход: ${dailyData.income.length} операций\n`;
-        msg += `   📤 Расход: ${dailyData.expense.length} операций\n`;
-        msg += `   💰 Сумма продаж: *${formatNumber(dailyData.totals.expenseSum)} $*`;
-        
-        // Сохраняем данные для экспорта
-        sessions[userId].lastDailyReport = { dailyData, reportDate, formattedDate };
-        saveSessions();
-        
-        // Кнопка экспорта
-        const exportButton = Markup.inlineKeyboard([
-            [Markup.button.callback('📊 Экспорт в Excel', `exdaily_${dateType}`)]
-        ]);
-        
-        if (msg.length > 4000) {
-            const parts = msg.match(/[\s\S]{1,4000}/g);
-            for (let i = 0; i < parts.length - 1; i++) {
-                await ctx.reply(parts[i], { parse_mode: 'Markdown' });
-            }
-            await ctx.reply(parts[parts.length - 1], { parse_mode: 'Markdown', ...exportButton });
-        } else {
-            await ctx.reply(msg, { parse_mode: 'Markdown', ...exportButton });
-        }
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Экспорт отчёта за день в Excel
-bot.action(/^exdaily_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.lastDailyReport) {
-        return ctx.answerCbQuery('❌ Сначала сформируйте отчёт');
-    }
-    
-    await ctx.answerCbQuery('📊 Создание Excel файла...');
-    
-    const { dailyData, reportDate, formattedDate } = session.lastDailyReport;
-    
-    try {
-        const workbook = new ExcelJS.Workbook();
-        
-        // Лист 1: Приход
-        const incomeSheet = workbook.addWorksheet('Приход');
-        incomeSheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Вагон', key: 'wagon', width: 15 },
-            { header: 'Фирма', key: 'company', width: 15 },
-            { header: 'Склад', key: 'warehouse', width: 15 },
-            { header: 'Товар', key: 'product', width: 15 },
-            { header: 'По док', key: 'qtyDoc', width: 10 },
-            { header: 'По факту', key: 'qtyFact', width: 10 },
-            { header: 'Разница', key: 'diff', width: 10 },
-            { header: 'Вес (т)', key: 'weight', width: 10 }
-        ];
-        
-        incomeSheet.getRow(1).font = { bold: true };
-        incomeSheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF90EE90' } };
-        
-        let incTotalDoc = 0, incTotalFact = 0, incTotalWeight = 0;
-        dailyData.income.forEach((item, i) => {
-            incomeSheet.addRow({
-                num: i + 1,
-                date: item.date,
-                wagon: item.wagon || '',
-                company: item.company,
-                warehouse: item.warehouse,
-                product: item.product,
-                qtyDoc: item.qtyDoc,
-                qtyFact: item.qtyFact,
-                diff: (item.qtyFact || 0) - (item.qtyDoc || 0),
-                weight: item.weightTons
-            });
-            incTotalDoc += item.qtyDoc || 0;
-            incTotalFact += item.qtyFact || 0;
-            incTotalWeight += item.weightTons || 0;
-        });
-        
-        const incLastRow = incomeSheet.addRow({
-            num: '', date: '', wagon: '', company: '', warehouse: 'ИТОГО:',
-            product: '', qtyDoc: incTotalDoc, qtyFact: incTotalFact,
-            diff: incTotalFact - incTotalDoc, weight: incTotalWeight
-        });
-        incLastRow.font = { bold: true };
-        incLastRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF0B3' } };
-        
-        // Лист 2: Расход
-        const expenseSheet = workbook.addWorksheet('Расход');
-        expenseSheet.columns = [
-            { header: '№', key: 'num', width: 5 },
-            { header: 'Дата', key: 'date', width: 12 },
-            { header: 'Клиент', key: 'client', width: 20 },
-            { header: 'Фирма', key: 'company', width: 15 },
-            { header: 'Склад', key: 'warehouse', width: 15 },
-            { header: 'Товар', key: 'product', width: 15 },
-            { header: 'Кол-во', key: 'quantity', width: 10 },
-            { header: 'Тонны', key: 'tons', width: 10 },
-            { header: 'Цена', key: 'price', width: 10 },
-            { header: 'Сумма', key: 'total', width: 12 },
-            { header: 'Примечания', key: 'notes', width: 20 }
-        ];
-        
-        expenseSheet.getRow(1).font = { bold: true };
-        expenseSheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFCCCB' } };
-        
-        let expTotalQty = 0, expTotalTons = 0, expTotalSum = 0;
-        dailyData.expense.forEach((item, i) => {
-            expenseSheet.addRow({
-                num: i + 1,
-                date: item.date,
-                client: item.client,
-                company: item.company,
-                warehouse: item.warehouse,
-                product: item.product,
-                quantity: item.quantity,
-                tons: item.tons,
-                price: item.price,
-                total: item.total,
-                notes: item.notes || ''
-            });
-            expTotalQty += item.quantity || 0;
-            expTotalTons += item.tons || 0;
-            expTotalSum += item.total || 0;
-        });
-        
-        const expLastRow = expenseSheet.addRow({
-            num: '', date: '', client: '', company: '', warehouse: 'ИТОГО:',
-            product: '', quantity: expTotalQty, tons: expTotalTons,
-            price: '', total: expTotalSum, notes: ''
-        });
-        expLastRow.font = { bold: true };
-        expLastRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFFFF0B3' } };
-        
-        // Сохраняем файл
-        const fileName = `Отчет_за_${formattedDate.replace(/\./g, '-')}.xlsx`;
-        const filePath = path.join(__dirname, fileName);
-        
-        await workbook.xlsx.writeFile(filePath);
-        await ctx.replyWithDocument({ source: filePath, filename: fileName });
-        fs.unlinkSync(filePath);
-        
-    } catch (e) {
-        console.error('Ошибка экспорта:', e);
-        ctx.reply('❌ Ошибка создания Excel файла');
-    }
-});
-
-// Расход за день - главное меню
-bot.hears(/📤|расход за день/i, async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.reply('⏳ Загрузка расхода за день...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.expense) {
-            return ctx.reply(`📤 Нет данных о расходе за ${year} год`);
-        }
-        
-        // Получаем сегодняшнюю дату
-        const today = new Date().toISOString().split('T')[0];
-        
-        // Фильтруем расходы только за сегодня
-        const todayExpense = (yearData.expense || [])
-            .filter(item => !item.isDeleted && item.date === today);
-        
-        if (todayExpense.length === 0) {
-            const formattedDate = new Date().toLocaleDateString('ru-RU');
-            const noDataMsg = `📤 Сегодня расходов не было\n📅 ${formattedDate}`;
-            
-            // Добавляем inline кнопки даже если нет данных
-            const groupButtons = [
-                [
-                    Markup.button.callback('📅 Вчера', 'expense_yesterday'),
-                    Markup.button.callback('📅 Позавчера', 'expense_2days')
-                ]
-            ];
-            
-            const keyboard = Markup.inlineKeyboard(groupButtons);
-            return ctx.reply(noDataMsg, keyboard);
-        }
-        
-        // Группируем по складам и товарам
-        const expenseByWarehouse = {};
-        const expenseByProduct = {};
-        
-        todayExpense.forEach(item => {
-            const warehouse = item.warehouse || 'Без склада';
-            const product = item.product || 'Без товара';
-            const tons = (parseFloat(item.quantity) || 0) / 20;
-            
-            // По складам
-            if (!expenseByWarehouse[warehouse]) {
-                expenseByWarehouse[warehouse] = {};
-            }
-            if (!expenseByWarehouse[warehouse][product]) {
-                expenseByWarehouse[warehouse][product] = 0;
-            }
-            expenseByWarehouse[warehouse][product] += tons;
-            
-            // По товарам (общий)
-            if (!expenseByProduct[product]) {
-                expenseByProduct[product] = 0;
-            }
-            expenseByProduct[product] += tons;
-        });
-        
-        // Получаем группы складов
-        const warehouseGroups = {};
-        (data.warehouses || []).forEach(w => {
-            if (w.name && w.group) {
-                warehouseGroups[w.name] = w.group;
-            }
-        });
-        
-        // Группируем по группам складов и товарам (без складов в названии)
-        const groupedExpense = {};
-        Object.entries(expenseByWarehouse).forEach(([warehouse, products]) => {
-            const group = warehouseGroups[warehouse] || 'Без группы';
-            if (!groupedExpense[group]) {
-                groupedExpense[group] = {};
-            }
-            
-            // Суммируем товары по группе (без привязки к складу)
-            Object.entries(products).forEach(([product, tons]) => {
-                if (!groupedExpense[group][product]) {
-                    groupedExpense[group][product] = 0;
-                }
-                groupedExpense[group][product] += tons;
-            });
-        });
-        
-        // Формируем сообщение - показываем расход по группам
-        const formattedDate = new Date().toLocaleDateString('ru-RU');
-        let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate}\n${'═'.repeat(25)}\n\n`;
-        
-        let grandTotal = 0;
-        const totalByProduct = {}; // Для итогов по товарам
-        
-        // Выводим расход по группам складов
-        Object.entries(groupedExpense).sort().forEach(([group, products]) => {
-            msg += `📁 *${group}*\n`;
-            msg += `${'─'.repeat(20)}\n`;
-            
-            let groupTotal = 0;
-            
-            // Выводим товары группы
-            Object.entries(products).sort().forEach(([product, tons]) => {
-                if (tons > 0.01) {
-                    msg += `${product}\t${formatNumber(tons)} т/н\n`;
-                    groupTotal += tons;
-                    
-                    // Суммируем для общих итогов по товарам
-                    if (!totalByProduct[product]) {
-                        totalByProduct[product] = 0;
-                    }
-                    totalByProduct[product] += tons;
-                }
-            });
-            
-            msg += `\n`;
-            grandTotal += groupTotal;
-        });
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `💰 *Всего: ${formatNumber(grandTotal)} т*\n\n`;
-        
-        // Добавляем итоги по товарам
-        if (Object.keys(totalByProduct).length > 0) {
-            msg += `📦 *ИТОГО ПО ТОВАРАМ:*\n`;
-            msg += `${'─'.repeat(20)}\n`;
-            Object.entries(totalByProduct).sort().forEach(([product, tons]) => {
-                msg += `${product}\t${formatNumber(tons)} т/н\n`;
-            });
-            msg += `\n`;
-        }
-        
-        // Создаем inline кнопки - только "Общий отчет" и "Обновить"
-        const groupButtons = [
-            [Markup.button.callback('📊 Общий отчет', 'expense_total')],
-            [
-                Markup.button.callback('📅 Вчера', 'expense_yesterday'),
-                Markup.button.callback('📅 Позавчера', 'expense_2days')
-            ],
-            [Markup.button.callback('🔄 Обновить', 'expense_refresh')]
-        ];
-        
-        const keyboard = Markup.inlineKeyboard(groupButtons);
-        
-        // Сохраняем данные в сессию для фильтрации
-        sessions[userId].todayExpenseData = {
-            groupedExpense,
-            expenseByProduct,
-            warehouseGroups,
-            year,
-            date: today,
-            formattedDate
-        };
-        saveSessions();
-        
-        msg += `${'═'.repeat(25)}\n`;
-        msg += `📊 Выберите отчет:`;
-        
-        ctx.reply(msg, { parse_mode: 'Markdown', ...keyboard });
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Обработка выбора группы складов для расхода за день
-bot.action(/^expense_group_(.+)$/, async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.todayExpenseData) {
-        return ctx.answerCbQuery('❌ Данные устарели, обновите отчет');
-    }
-    
-    const groupBase64 = ctx.match[1];
-    const selectedGroup = Buffer.from(groupBase64, 'base64').toString('utf-8');
-    
-    await ctx.answerCbQuery(`📁 ${selectedGroup}`);
-    
-    const { groupedExpense, formattedDate } = session.todayExpenseData;
-    
-    if (!groupedExpense[selectedGroup]) {
-        return ctx.reply('❌ Группа не найдена');
-    }
-    
-    let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate}\n`;
-    msg += `📁 Группа: *${selectedGroup}*\n`;
-    msg += `${'═'.repeat(25)}\n\n`;
-    
-    let groupTotal = 0;
-    
-    // Выводим товары группы (без разбивки по складам)
-    Object.entries(groupedExpense[selectedGroup]).sort().forEach(([product, tons]) => {
-        if (tons > 0.01) {
-            msg += `${product}\t${formatNumber(tons)} т/н\n`;
-            groupTotal += tons;
-        }
+    ctx.reply('Главное меню:', {
+      reply_markup: { keyboard, resize_keyboard: true }
     });
+  } else {
+    const keyboard = [
+      [{ text: '🏬 Склад' }]
+    ];
     
-    msg += `\n${'═'.repeat(25)}\n`;
-    msg += `📊 *Итого ${selectedGroup}: ${formatNumber(groupTotal)} т*`;
-    
-    // Кнопка "Назад"
-    const backButton = Markup.inlineKeyboard([
-        [Markup.button.callback('🔙 Назад к общему списку', 'expense_back')]
-    ]);
-    
-    ctx.reply(msg, { parse_mode: 'Markdown', ...backButton });
-});
-
-// Обработка кнопки "Общий отчет"
-bot.action('expense_total', async (ctx) => {
-    const userId = ctx.from.id;
-    const session = getSession(userId);
-    
-    if (!session.todayExpenseData) {
-        return ctx.answerCbQuery('❌ Данные устарели, обновите отчет');
-    }
-    
-    await ctx.answerCbQuery('📊 Общий отчет');
-    
-    const { expenseByProduct, formattedDate } = session.todayExpenseData;
-    
-    let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate}\n`;
-    msg += `📊 *ОБЩИЙ ОТЧЕТ*\n`;
-    msg += `${'═'.repeat(25)}\n\n`;
-    
-    let grandTotal = 0;
-    
-    // Выводим общий список по товарам
-    Object.entries(expenseByProduct).sort().forEach(([product, tons]) => {
-        if (tons > 0.01) {
-            msg += `${product}\t${formatNumber(tons)} т/н\n`;
-            grandTotal += tons;
-        }
+    ctx.reply('Главное меню:', {
+      reply_markup: { keyboard, resize_keyboard: true }
     });
-    
-    msg += `\n${'═'.repeat(25)}\n`;
-    msg += `💰 *Всего: ${formatNumber(grandTotal)} т*`;
-    
-    // Кнопка "Назад"
-    const backButton = Markup.inlineKeyboard([
-        [Markup.button.callback('🔙 Назад', 'expense_back')]
-    ]);
-    
-    ctx.reply(msg, { parse_mode: 'Markdown', ...backButton });
+  }
 });
 
-// Обработка кнопки "Назад" и "Обновить"
-bot.action('expense_back', async (ctx) => {
-    await ctx.answerCbQuery('🔄');
-    // Повторно вызываем главный обработчик
-    ctx.message = { text: '📤 Расход за день' };
-    return bot.handleUpdate({ message: ctx.message, from: ctx.from, chat: ctx.chat });
+// Команда /cancel
+bot.command('cancel', (ctx) => {
+  orderData.delete(ctx.from.id);
+  ctx.reply('❌ Заявка отменена. Для новой заявки нажмите /start', {
+    reply_markup: { remove_keyboard: true }
+  });
 });
-
-bot.action('expense_refresh', async (ctx) => {
-    await ctx.answerCbQuery('🔄 Обновление...');
-    // Повторно вызываем главный обработчик
-    ctx.message = { text: '📤 Расход за день' };
-    return bot.handleUpdate({ message: ctx.message, from: ctx.from, chat: ctx.chat });
-});
-
-// Обработка кнопки "Вчера"
-bot.action('expense_yesterday', async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.answerCbQuery('� Загрузка данных за вчера...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.expense) {
-            return ctx.reply(`📤 Нет данных о расходе за ${year} год`);
-        }
-        
-        // Получаем вчерашнюю дату
-        const yesterday = new Date();
-        yesterday.setDate(yesterday.getDate() - 1);
-        const targetDate = yesterday.toISOString().split('T')[0];
-        const formattedDate = yesterday.toLocaleDateString('ru-RU');
-        
-        // Фильтруем расходы за вчера
-        const expense = (yearData.expense || [])
-            .filter(item => !item.isDeleted && item.date === targetDate);
-        
-        if (expense.length === 0) {
-            return ctx.reply(`📤 Вчера расходов не было\n📅 ${formattedDate}`);
-        }
-        
-        // Используем ту же логику группировки
-        const result = generateExpenseReport(data, expense, year, formattedDate, 'Вчера');
-        
-        const backButton = Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Назад', 'expense_back')]
-        ]);
-        
-        ctx.reply(result, { parse_mode: 'Markdown', ...backButton });
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Обработка кнопки "Позавчера"
-bot.action('expense_2days', async (ctx) => {
-    const userId = ctx.from.id;
-    const year = getUserYear(userId);
-    
-    await ctx.answerCbQuery('📅 Загрузка данных за позавчера...');
-    
-    try {
-        const data = await getData();
-        if (!data) return ctx.reply('❌ Не удалось получить данные');
-        
-        const yearData = data?.years?.[year];
-        if (!yearData || !yearData.expense) {
-            return ctx.reply(`📤 Нет данных о расходе за ${year} год`);
-        }
-        
-        // Получаем позавчерашнюю дату
-        const twoDaysAgo = new Date();
-        twoDaysAgo.setDate(twoDaysAgo.getDate() - 2);
-        const targetDate = twoDaysAgo.toISOString().split('T')[0];
-        const formattedDate = twoDaysAgo.toLocaleDateString('ru-RU');
-        
-        // Фильтруем расходы за позавчера
-        const expense = (yearData.expense || [])
-            .filter(item => !item.isDeleted && item.date === targetDate);
-        
-        if (expense.length === 0) {
-            return ctx.reply(`📤 Позавчера расходов не было\n📅 ${formattedDate}`);
-        }
-        
-        // Используем ту же логику группировки
-        const result = generateExpenseReport(data, expense, year, formattedDate, 'Позавчера');
-        
-        const backButton = Markup.inlineKeyboard([
-            [Markup.button.callback('🔙 Назад', 'expense_back')]
-        ]);
-        
-        ctx.reply(result, { parse_mode: 'Markdown', ...backButton });
-        
-    } catch (e) {
-        console.error('Ошибка:', e);
-        ctx.reply('❌ Ошибка загрузки данных');
-    }
-});
-
-// Функция для генерации отчета о расходе (используется для всех дат)
-function generateExpenseReport(data, expenseData, year, formattedDate, dateLabel) {
-    // Группируем по складам и товарам
-    const expenseByWarehouse = {};
-    const expenseByProduct = {};
-    
-    expenseData.forEach(item => {
-        const warehouse = item.warehouse || 'Без склада';
-        const product = item.product || 'Без товара';
-        const tons = (parseFloat(item.quantity) || 0) / 20;
-        
-        // По складам
-        if (!expenseByWarehouse[warehouse]) {
-            expenseByWarehouse[warehouse] = {};
-        }
-        if (!expenseByWarehouse[warehouse][product]) {
-            expenseByWarehouse[warehouse][product] = 0;
-        }
-        expenseByWarehouse[warehouse][product] += tons;
-        
-        // По товарам (общий)
-        if (!expenseByProduct[product]) {
-            expenseByProduct[product] = 0;
-        }
-        expenseByProduct[product] += tons;
-    });
-    
-    // Получаем группы складов
-    const warehouseGroups = {};
-    (data.warehouses || []).forEach(w => {
-        if (w.name && w.group) {
-            warehouseGroups[w.name] = w.group;
-        }
-    });
-    
-    // Группируем по группам складов и товарам (без складов в названии)
-    const groupedExpense = {};
-    Object.entries(expenseByWarehouse).forEach(([warehouse, products]) => {
-        const group = warehouseGroups[warehouse] || 'Без группы';
-        if (!groupedExpense[group]) {
-            groupedExpense[group] = {};
-        }
-        
-        // Суммируем товары по группе (без привязки к складу)
-        Object.entries(products).forEach(([product, tons]) => {
-            if (!groupedExpense[group][product]) {
-                groupedExpense[group][product] = 0;
-            }
-            groupedExpense[group][product] += tons;
-        });
-    });
-    
-    // Формируем сообщение
-    let msg = `📤 *РАСХОД ТОВАРОВ*\n📅 ${formattedDate} (${dateLabel})\n${'═'.repeat(25)}\n\n`;
-    
-    let grandTotal = 0;
-    const totalByProduct = {}; // Для итогов по товарам
-    
-    // Выводим расход по группам складов
-    Object.entries(groupedExpense).sort().forEach(([group, products]) => {
-        msg += `📁 *${group}*\n`;
-        msg += `${'─'.repeat(20)}\n`;
-        
-        let groupTotal = 0;
-        
-        // Выводим товары группы
-        Object.entries(products).sort().forEach(([product, tons]) => {
-            if (tons > 0.01) {
-                msg += `${product}\t${formatNumber(tons)} т/н\n`;
-                groupTotal += tons;
-                
-                // Суммируем для общих итогов по товарам
-                if (!totalByProduct[product]) {
-                    totalByProduct[product] = 0;
-                }
-                totalByProduct[product] += tons;
-            }
-        });
-        
-        msg += `\n`;
-        grandTotal += groupTotal;
-    });
-    
-    msg += `${'═'.repeat(25)}\n`;
-    msg += `💰 *Всего: ${formatNumber(grandTotal)} т*\n\n`;
-    
-    // Добавляем итоги по товарам
-    if (Object.keys(totalByProduct).length > 0) {
-        msg += `📦 *ИТОГО ПО ТОВАРАМ:*\n`;
-        msg += `${'─'.repeat(20)}\n`;
-        Object.entries(totalByProduct).sort().forEach(([product, tons]) => {
-            msg += `${product}\t${formatNumber(tons)} т/н\n`;
-        });
-    }
-    
-    return msg;
-}
 
 // Запуск бота
-console.log('🔄 Подключение к Telegram API...');
-
-(async () => {
-    try {
-        const botInfo = await bot.telegram.getMe();
-        console.log(`✅ Бот подключен: @${botInfo.username}`);
-        
-        await bot.telegram.deleteWebhook({ drop_pending_updates: true });
-        
-        bot.launch().catch(err => console.error('❌ Ошибка polling:', err.message));
-        
-        console.log('✅ Бот запущен!');
-        console.log(`📱 Найдите @${botInfo.username} в Telegram`);
-        console.log('');
-        console.log('Для входа используйте логин/пароль из приложения Avesta');
-        if (!firebaseDb) {
-            console.log('');
-            console.log('⚠️  Firebase Admin SDK не настроен!');
-            console.log('    Для работы измените правила Firebase или добавьте');
-            console.log('    файл firebase-service-account.json');
-        }
-    } catch (err) {
-        console.error('❌ Ошибка:', err.message);
-        process.exit(1);
+async function startBot() {
+  try {
+    console.log('🚀 Запуск бота...');
+    console.log(`📋 NODE_ENV: ${process.env.NODE_ENV || 'не задан'}`);
+    console.log(`🔑 TELEGRAM_BOT_TOKEN: ${process.env.TELEGRAM_BOT_TOKEN ? '✅ задан' : '❌ НЕ ЗАДАН'}`);
+    console.log(`🗄️ DATABASE_URL: ${process.env.DATABASE_URL ? '✅ задан' : '❌ НЕ ЗАДАН'}`);
+    console.log(`📱 GREEN_API_INSTANCE_ID: ${process.env.GREEN_API_INSTANCE_ID ? '✅ задан' : '❌ не задан'}`);
+    console.log(`📱 GREEN_API_TOKEN: ${process.env.GREEN_API_TOKEN ? '✅ задан' : '❌ не задан'}`);
+    console.log(`💬 TELEGRAM_GROUP_ID: ${process.env.TELEGRAM_GROUP_ID ? '✅ задан' : '❌ не задан'}`);
+    
+    if (!process.env.TELEGRAM_BOT_TOKEN) {
+      console.error('❌ КРИТИЧЕСКАЯ ОШИБКА: TELEGRAM_BOT_TOKEN не задан!');
+      console.error('💡 Добавьте переменную окружения TELEGRAM_BOT_TOKEN в Railway');
+      process.exit(1);
     }
-})();
+    
+    // Выполняем автоматическую миграцию перед запуском
+    await autoMigrate();
+    
+    const PORT = process.env.PORT || 3000;
+    const WEBHOOK_DOMAIN = process.env.WEBHOOK_DOMAIN || process.env.RAILWAY_STATIC_URL || process.env.RAILWAY_PUBLIC_DOMAIN;
+    
+    if (WEBHOOK_DOMAIN) {
+      // Webhook режим для Railway/production
+      const domain = WEBHOOK_DOMAIN.startsWith('https://') ? WEBHOOK_DOMAIN : `https://${WEBHOOK_DOMAIN}`;
+      console.log(`🌐 Запуск в webhook режиме: ${domain}, порт: ${PORT}`);
+      
+      await bot.launch({
+        webhook: {
+          domain: domain,
+          port: PORT
+        }
+      });
+      
+      console.log('🤖 Бот запущен в webhook режиме!');
+    } else {
+      // Polling режим для локальной разработки
+      console.log('🔄 Запуск в polling режиме (локальная разработка)...');
+      await bot.launch();
+      console.log('🤖 Бот запущен в polling режиме!');
+    }
+    
+    const botInfo = await bot.telegram.getMe();
+    console.log('📱 Telegram: @' + botInfo.username);
+    console.log('✅ Бот готов к работе!');
+  } catch (error) {
+    console.error('❌ Ошибка запуска бота:', error);
+    process.exit(1);
+  }
+}
 
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+startBot();
+
+// Graceful shutdown
+process.once('SIGINT', () => {
+  bot.stop('SIGINT');
+  database.close();
+});
+process.once('SIGTERM', () => {
+  bot.stop('SIGTERM');
+  database.close();
+});
+
+// Экспортируем функцию для использования в admin.js
+module.exports = { loadWarehousesAndProducts, dataManager };
