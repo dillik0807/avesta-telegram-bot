@@ -147,6 +147,20 @@ class Database {
         console.log(`⚠️ Ошибка добавления clients.is_active: ${e.message}`);
       }
 
+      // Миграция: cash_access для clients
+      try {
+        const check = await this.pool.query(`
+          SELECT column_name FROM information_schema.columns 
+          WHERE table_name = 'clients' AND column_name = 'cash_access'
+        `);
+        if (check.rows.length === 0) {
+          await this.pool.query(`ALTER TABLE clients ADD COLUMN cash_access INTEGER DEFAULT 0`);
+          console.log('✅ Колонка clients.cash_access добавлена');
+        }
+      } catch (e) {
+        console.log(`⚠️ Ошибка добавления clients.cash_access: ${e.message}`);
+      }
+
       // Таблица товаров
       await this.pool.query(`
         CREATE TABLE IF NOT EXISTS products (
@@ -157,9 +171,42 @@ class Database {
         )
       `);
 
+      // Таблица записей кассы
+      await this.pool.query(`
+        CREATE TABLE IF NOT EXISTS cash_records (
+          id SERIAL PRIMARY KEY,
+          client_id BIGINT,
+          client_name TEXT,
+          client_phone TEXT,
+          mode TEXT NOT NULL,
+          usd NUMERIC DEFAULT 0,
+          somoni NUMERIC DEFAULT 0,
+          rate NUMERIC DEFAULT 0,
+          admin_id BIGINT,
+          comment TEXT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+
+      // Миграция: добавить колонку comment если её нет
+      await this.pool.query(`ALTER TABLE cash_records ADD COLUMN IF NOT EXISTS comment TEXT`).catch(() => {});
+
+      // Таблица дат передачи отчёта кассиру
+      await this.pool.query(`
+        CREATE TABLE IF NOT EXISTS cash_report_sent (
+          id SERIAL PRIMARY KEY,
+          sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+
       console.log('✅ Таблицы PostgreSQL инициализированы');
     } catch (error) {
-      console.error('❌ Ошибка инициализации таблиц:', error);
+      // Тихо — при локальном запуске railway.internal недоступен, wrapper переключит на SQLite
+      if (error.code === 'ENOTFOUND' || error.code === 'ECONNREFUSED' || String(error.message).includes('railway.internal')) {
+        console.log('⚠️  PostgreSQL (railway.internal) недоступен локально — используется SQLite');
+      } else {
+        console.error('❌ Ошибка инициализации таблиц:', error.message);
+      }
     }
   }
 
@@ -273,6 +320,54 @@ class Database {
     }
   }
 
+  // ── Доступ к кассе для клиентов ──────────────────────────────────────────────
+  async hasCashAccess(telegramId) {
+    try {
+      const result = await this.pool.query(
+        'SELECT cash_access FROM clients WHERE telegram_id = $1 AND is_active = 1',
+        [telegramId]
+      );
+      return result.rows.length > 0 && result.rows[0].cash_access === 1;
+    } catch (error) {
+      return false;
+    }
+  }
+
+  async grantCashAccess(telegramId) {
+    try {
+      const result = await this.pool.query(
+        'UPDATE clients SET cash_access = 1 WHERE telegram_id = $1 AND is_active = 1',
+        [telegramId]
+      );
+      return result.rowCount > 0;
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async revokeCashAccess(telegramId) {
+    try {
+      const result = await this.pool.query(
+        'UPDATE clients SET cash_access = 0 WHERE telegram_id = $1',
+        [telegramId]
+      );
+      return result.rowCount > 0;
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async getClientsWithCashAccess() {
+    try {
+      const result = await this.pool.query(
+        'SELECT telegram_id, name, phone FROM clients WHERE is_active = 1 AND cash_access = 1 ORDER BY name'
+      );
+      return result.rows;
+    } catch (error) {
+      throw error;
+    }
+  }
+
   async getStats() {
     try {
       const clientsResult = await this.pool.query(
@@ -358,6 +453,7 @@ class Database {
         SELECT 
           warehouse,
           COUNT(*) as orders_count,
+          COUNT(DISTINCT user_id) as unique_clients,
           MAX(created_at) as last_order_date
         FROM orders 
         WHERE (is_deleted = 0 OR is_deleted IS NULL)
@@ -686,6 +782,162 @@ class Database {
     } catch (error) {
       console.error('❌ Ошибка получения заявок клиента:', error);
       return [];
+    }
+  }
+
+  async addCashRecord(clientId, clientName, clientPhone, mode, usd, somoni, rate, adminId, comment) {
+    try {
+      await this.pool.query(
+        `INSERT INTO cash_records (client_id, client_name, client_phone, mode, usd, somoni, rate, admin_id, comment)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+        [clientId, clientName, clientPhone, mode, usd || 0, somoni || 0, rate || 0, adminId, comment || null]
+      ).catch(async () => {
+        // Если колонки comment нет — добавляем её и повторяем
+        await this.pool.query(`ALTER TABLE cash_records ADD COLUMN IF NOT EXISTS comment TEXT`);
+        await this.pool.query(
+          `INSERT INTO cash_records (client_id, client_name, client_phone, mode, usd, somoni, rate, admin_id, comment)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [clientId, clientName, clientPhone, mode, usd || 0, somoni || 0, rate || 0, adminId, comment || null]
+        );
+      });
+      return true;
+    } catch (error) {
+      console.error('❌ Ошибка сохранения записи кассы:', error);
+      return false;
+    }
+  }
+
+  async getLastCashReportSent() {
+    try {
+      const result = await this.pool.query(
+        `SELECT sent_at FROM cash_report_sent ORDER BY sent_at DESC LIMIT 1`
+      );
+      return result.rows.length > 0 ? result.rows[0].sent_at : null;
+    } catch (error) {
+      console.error('❌ Ошибка получения даты передачи:', error);
+      return null;
+    }
+  }
+
+  async markCashReportSent() {
+    try {
+      await this.pool.query(`INSERT INTO cash_report_sent DEFAULT VALUES`);
+      return true;
+    } catch (error) {
+      console.error('❌ Ошибка сохранения даты передачи:', error);
+      return false;
+    }
+  }
+
+  async getCashSummary(days) {
+    try {
+      const where = days ? `WHERE created_at >= NOW() - INTERVAL '${days} days'` : '';
+      // Итоги по периоду
+      const totals = await this.pool.query(`
+        SELECT 
+          COALESCE(SUM(usd), 0) AS total_usd,
+          COALESCE(SUM(somoni), 0) AS total_somoni,
+          COUNT(*) AS count
+        FROM cash_records ${where}
+      `);
+      // Итоги по месяцам
+      const monthly = await this.pool.query(`
+        SELECT 
+          TO_CHAR(created_at, 'YYYY-MM') AS month,
+          COALESCE(SUM(usd), 0) AS usd,
+          COALESCE(SUM(somoni), 0) AS somoni,
+          COUNT(*) AS count
+        FROM cash_records ${where}
+        GROUP BY month
+        ORDER BY month DESC
+      `);
+      return { totals: totals.rows[0], monthly: monthly.rows };
+    } catch (error) {
+      console.error('❌ Ошибка сводного отчёта:', error);
+      return { totals: { total_usd: 0, total_somoni: 0, count: 0 }, monthly: [] };
+    }
+  }
+
+  async getCashReport(days) {
+    try {
+      const lastSent = await this.getLastCashReportSent();
+      let whereClause;
+      let params = [];
+      if (lastSent) {
+        whereClause = `WHERE created_at > $1`;
+        params = [lastSent];
+      } else {
+        whereClause = `WHERE created_at >= NOW() - INTERVAL '${days} days'`;
+      }
+      const result = await this.pool.query(`
+        SELECT client_name, client_phone, mode, usd, somoni, rate, comment, created_at
+        FROM cash_records
+        ${whereClause}
+        ORDER BY created_at DESC
+      `, params);
+      return result.rows;
+    } catch (error) {
+      console.error('❌ Ошибка получения отчёта кассы:', error);
+      return [];
+    }
+  }
+
+  async getCashTotals(days = 7) {
+    try {
+      const lastSent = await this.getLastCashReportSent();
+      let whereClause;
+      let params = [];
+      if (lastSent) {
+        whereClause = `WHERE created_at > $1`;
+        params = [lastSent];
+      } else {
+        whereClause = `WHERE created_at >= NOW() - INTERVAL '${days} days'`;
+      }
+      const result = await this.pool.query(`
+        SELECT 
+          COALESCE(SUM(usd), 0) AS total_usd,
+          COALESCE(SUM(somoni), 0) AS total_somoni,
+          COUNT(*) AS count
+        FROM cash_records
+        ${whereClause}
+      `, params);
+      return result.rows[0];
+    } catch (error) {
+      console.error('❌ Ошибка получения итогов кассы:', error);
+      return { total_usd: 0, total_somoni: 0, count: 0 };
+    }
+  }
+
+  // ── Отчёт кассы по конкретному создателю (для клиентов-операторов) ──────────
+  async getCashReportByCreator(creatorId) {
+    try {
+      const result = await this.pool.query(`
+        SELECT client_name, client_phone, mode, usd, somoni, rate, comment, created_at
+        FROM cash_records
+        WHERE admin_id = $1
+        ORDER BY created_at DESC
+      `, [creatorId]);
+      return result.rows;
+    } catch (error) {
+      console.error('❌ Ошибка получения отчёта по создателю:', error);
+      return [];
+    }
+  }
+
+  async getCashTotalsByCreator(creatorId) {
+    try {
+      const result = await this.pool.query(`
+        SELECT 
+          COALESCE(SUM(usd), 0) AS total_usd,
+          COALESCE(SUM(somoni), 0) AS total_somoni,
+          COUNT(*) AS count
+        FROM cash_records
+        WHERE admin_id = $1
+      `, [creatorId]);
+      return result.rows[0];
+    } catch (error) {
+      console.error('❌ Ошибка получения итогов по создателю:', error);
+      return { total_usd: 0, total_somoni: 0, count: 0 };
     }
   }
 
